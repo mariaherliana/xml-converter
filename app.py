@@ -83,7 +83,11 @@ def pad_npwp_to_22(npwp_raw: str) -> str:
     return digits.zfill(22)
 
 def extract_fields_from_text(text: str) -> dict:
-    """Parse key invoice fields from text-based PDF invoices with stable label layout."""
+    """
+    Improved, line-oriented extractor for your fixed-layout, text-based invoices.
+    Returns dict with keys:
+      buyer_name, buyer_address, npwp, issue_date, invoice_no, subtotal, vat, total
+    """
     out = {
         "buyer_name": "",
         "buyer_address": "",
@@ -92,154 +96,177 @@ def extract_fields_from_text(text: str) -> dict:
         "invoice_no": "",
         "subtotal": None,
         "vat": None,
-        "total": None,
+        "total": None
     }
 
-    # normalize
-    t = re.sub(r"\s+", " ", text)
+    # Make sure we preserve lines, remove trailing/leading spaces
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # unify some known label variants (lowercase copy for searching)
+    low_lines = [ln.lower() for ln in lines]
 
-    # invoice number
-    m = re.search(r"Invoice\s*(?:No|#)[:\s]+([A-Za-z0-9\-\(\)\._\/]+)", t, re.IGNORECASE)
-    if m:
-        out["invoice_no"] = m.group(1).strip()
+    # --- Helper local functions ---
+    def find_line_containing(key_variants):
+        """Return first index of a line containing any of the key_variants (case-insensitive)."""
+        for idx, l in enumerate(low_lines):
+            for k in key_variants:
+                if k in l:
+                    return idx
+        return None
 
-    # issue date
-    m = re.search(r"(?:Issue\s*Date|Tanggal\s*Faktur)[:\s]+([0-3]?\d\s*[A-Za-z]{3,9}\s*\d{4})", t, re.IGNORECASE)
-    if m:
-        raw_date = m.group(1).strip()
-        try:
-            dt = datetime.strptime(raw_date, "%d %b %Y")
-        except Exception:
-            try:
-                dt = datetime.strptime(raw_date, "%d %B %Y")
-            except Exception:
-                dt = None
-        out["issue_date"] = dt.strftime("%Y-%m-%d") if dt else raw_date
-
-    # buyer name
-    m = re.search(r"To[:\s]+([A-Z0-9\s\.\,&\-]+?)(?=\s+NPWP|Alamat|Issue|Invoice|No|Tanggal|$)", t, re.IGNORECASE)
-    if m:
-        out["buyer_name"] = m.group(1).strip()
-
-    # NPWP
-    m = re.search(r"NPWP[:\s]*([0-9\.\-]+)", t, re.IGNORECASE)
-    if m:
-        raw_npwp = re.sub(r"\D", "", m.group(1))  # strip non-digits
-        # ensure at least 16 digits by left-padding with zeros
-        if len(raw_npwp) < 16:
-            raw_npwp = raw_npwp.zfill(16)
-        out["npwp"] = raw_npwp
-
-    # Subtotal / DPP
-    m = re.search(r"(?:Sub\s*Total|Subtotal)[:\s]*([0-9\.,]+)", t, re.IGNORECASE)
-    if m:
-        out["subtotal"] = clean_number(m.group(1))
-
-    # VAT
-    m = re.search(r"(?:VAT|PPN)[:\s]*([0-9\.,]+)", t, re.IGNORECASE)
-    if m:
-        out["vat"] = clean_number(m.group(1))
-
-    # Total
-    m = re.search(r"Total[:\s]*([0-9\.,]+)", t, re.IGNORECASE)
-    if m:
-        out["total"] = clean_number(m.group(1))
-
-    return out
-
-    # NPWP: search for long digit sequences (10-22 digits)
-    npwp_match = None
-    for ln in lines:
-        m = re.search(r"(\d{9,22})", ln.replace(" ", ""))
+    def extract_after_label(line, label_regex):
+        """Try to extract value after label within the same line using label_regex with a capture group."""
+        m = re.search(label_regex, line, re.IGNORECASE)
         if m:
-            maybe = m.group(1)
-            # filter out phone numbers (10-12 digits) vs NPWP often >= 15? we'll accept >=9 and then pad later
-            npwp_match = maybe
-            break
-    if npwp_match:
-        out["npwp"] = npwp_match
+            val = m.group(1).strip()
+            return val
+        return None
 
-    # Issue Date: look for patterns like "Issue Date", "Tanggal Faktur" etc.
-    date_patterns = [
-        r"Issue Date[:\s]*([0-3]?\d[\/\-][0-1]?\d[\/\-]\d{2,4})",
-        r"Tanggal Faktur[:\s]*([0-3]?\d[\/\-][0-1]?\d[\/\-]\d{2,4})",
-        r"Issue Date[:\s]*([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4})",
-        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-        r"(\d{4}-\d{2}-\d{2})"
-    ]
-    for pat in date_patterns:
-        m = re.search(pat, t, re.IGNORECASE)
-        if m:
-            out["issue_date"] = m.group(1).strip()
-            break
-    # invoice no
-    m = re.search(r"Invoice No[:\s]*([A-Za-z0-9\-\_\/]+)", t, re.IGNORECASE)
-    if m:
-        out["invoice_no"] = m.group(1).strip()
+    # --- Invoice No ---
+    idx = find_line_containing(["invoice no", "invoice no:", "invoice#", "invoice #", "invoice"])
+    if idx is not None:
+        # try same-line extraction
+        val = extract_after_label(lines[idx], r"(?:invoice\s*(?:no|#)\s*[:\-]?\s*)(.+)$")
+        if not val:
+            # maybe "Invoice" then number on same line separated by spaces
+            parts = lines[idx].split()
+            if len(parts) > 1:
+                val = " ".join(parts[1:])
+        if val:
+            out["invoice_no"] = val.strip()
+
+    # --- Issue Date / Tanggal Faktur ---
+    idx = find_line_containing(["issue date", "tanggal faktur", "issue date:"])
+    if idx is not None:
+        # try same line first
+        val = extract_after_label(lines[idx], r"(?:issue\s*date|tanggal\s*faktur)\s*[:\-]?\s*(.+)$")
+        if not val and idx+1 < len(lines):
+            # maybe value on next line
+            val = lines[idx+1].strip()
+        if val:
+            # normalize date like '07 Oct 2025' to 'YYYY-MM-DD' if possible
+            raw = val
+            parsed = None
+            for fmt in ("%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                try:
+                    parsed = datetime.strptime(raw, fmt)
+                    break
+                except Exception:
+                    pass
+            out["issue_date"] = parsed.strftime("%Y-%m-%d") if parsed else raw
+
+    # --- Buyer name and address ---
+    # Preferred anchor: a line that starts with "To" or "To :"
+    idx = find_line_containing(["to :", "to:", "to "])
+    if idx is not None:
+        # buyer name may be on same line after "To:" or on next line
+        val = extract_after_label(lines[idx], r"to\s*[:\-]?\s*(.+)$")
+        if val:
+            out["buyer_name"] = val.strip()
+            # address follows starting at next line until we hit NPWP, Invoice, or blank
+            addr_lines = []
+            j = idx + 1
+            while j < len(lines):
+                l = lines[j]
+                if re.search(r"npwp|invoice|issue date|tanggal|total|vat|ppn", l, re.IGNORECASE):
+                    break
+                addr_lines.append(l)
+                j += 1
+            out["buyer_address"] = " ".join(addr_lines).strip()
+        else:
+            # if "To" line only, next line likely buyer name
+            if idx+1 < len(lines):
+                out["buyer_name"] = lines[idx+1].strip()
+                # address from idx+2 until NPWP or label
+                addr_lines = []
+                j = idx + 2
+                while j < len(lines):
+                    l = lines[j]
+                    if re.search(r"npwp|invoice|issue date|tanggal|total|vat|ppn", l, re.IGNORECASE):
+                        break
+                    addr_lines.append(l)
+                    j += 1
+                out["buyer_address"] = " ".join(addr_lines).strip()
     else:
-        # alternative look
-        m2 = re.search(r"Invoice\s*#[:\s]*([A-Za-z0-9\-\_\/]+)", t, re.IGNORECASE)
-        if m2:
-            out["invoice_no"] = m2.group(1).strip()
-
-    # Monetary values: Sub Total / Subtotal / TOTAL AMOUNT / TOTAL
-    # Find lines containing 'Sub Total' or 'SubTotal' or 'Sub Total' or the highlighted 'Sub Total' in screenshot
-    for ln in lines[::-1]:  # search from bottom up
-        if re.search(r"Sub\s*Total|Subtotal|Harga Satuan, DPP", ln, re.IGNORECASE):
-            # attempt to extract number from that line
-            num = re.search(r"([0-9\.,]+)", ln)
-            if num:
-                out["subtotal"] = clean_number(num.group(1))
+        # fallback: first fully uppercase line that looks like a company name (avoid "INVOICE" etc.)
+        for ln in lines[:10]:
+            if ln.isupper() and len(ln) > 3 and not re.search(r"invoice|revcomm|to", ln, re.IGNORECASE):
+                out["buyer_name"] = ln
                 break
-    # fallback: try VAT and Total lines
-    for ln in lines[::-1]:
-        if re.search(r"\bVAT\b", ln, re.IGNORECASE) and out["vat"] is None:
+
+    # --- NPWP (must be 16 digits left-padded with zero if shorter) ---
+    idx = find_line_containing(["npwp", "npwp/nik", "npwp :"])
+    if idx is not None:
+        # try same-line capture
+        val = extract_after_label(lines[idx], r"npwp(?:\/nik)?\s*[:\-]?\s*([0-9\.\- ]+)")
+        if not val and idx+1 < len(lines):
+            # maybe next line contains the digits
+            val = lines[idx+1].strip()
+        if val:
+            digits = re.sub(r"\D", "", val)
+            if len(digits) < 16:
+                digits = digits.zfill(16)
+            out["npwp"] = digits
+    else:
+        # fallback: search for a long digit sequence anywhere (common NPWP patterns)
+        for ln in lines:
+            m = re.search(r"(\d{8,16})", re.sub(r"\s", "", ln))
+            if m:
+                digits = m.group(1)
+                if len(digits) < 16:
+                    digits = digits.zfill(16)
+                out["npwp"] = digits
+                break
+
+    # --- Monetary amounts: Subtotal/DPP, VAT/PPN, Total ---
+    # Search bottom-up for labels because amounts usually placed near bottom
+    for i in range(len(lines)-1, -1, -1):
+        ln = lines[i]
+        low = low_lines[i]
+        # subtotal / DPP
+        if out["subtotal"] is None and re.search(r"sub\s*total|subtotal|harga satuan, dpp|sub total", low):
+            m = re.search(r"([0-9\.,]+)", ln)
+            if m:
+                out["subtotal"] = clean_number(m.group(1))
+                continue
+        # VAT / PPN
+        if out["vat"] is None and re.search(r"\b(vat|ppn)\b", low):
             m = re.search(r"([0-9\.,]+)", ln)
             if m:
                 out["vat"] = clean_number(m.group(1))
-        if re.search(r"\bTotal\b", ln, re.IGNORECASE):
+                continue
+        # total / total amount
+        if out["total"] is None and re.search(r"\b(total amount|total)\b", low):
             m = re.search(r"([0-9\.,]+)", ln)
             if m:
                 out["total"] = clean_number(m.group(1))
-                # maybe subtotal still missing
-                if out["subtotal"] is None:
-                    # attempt to get number from nearby line above
-                    # find index and check previous line
-                    try:
-                        idx = lines.index(ln)
-                        if idx > 0:
-                            prev = lines[idx-1]
-                            nm = re.search(r"([0-9\.,]+)", prev)
-                            if nm:
-                                out["subtotal"] = clean_number(nm.group(1))
-                    except ValueError:
-                        pass
+                # try to find subtotal if it's just above
+                if out["subtotal"] is None and i-1 >= 0:
+                    m2 = re.search(r"([0-9\.,]+)", lines[i-1])
+                    if m2:
+                        out["subtotal"] = clean_number(m2.group(1))
+                continue
 
-    # another heuristic: if subtotal still None, look for first numeric value in the items table region (like unit price qty total)
+    # final fallback heuristics if any are still None
     if out["subtotal"] is None:
-        for ln in lines[::-1]:
-            # often a big number like 762.300
+        # try to find first large numeric-looking value in the items region
+        for ln in lines:
             m = re.search(r"([0-9]{1,3}(?:[.,]\d{3})+)", ln)
             if m:
                 out["subtotal"] = clean_number(m.group(1))
                 break
 
-    # Normalize issue date to yyyy-mm-dd if possible
-    if out["issue_date"]:
-        try:
-            # try parsing common formats
-            possible = out["issue_date"].replace(".", "/").replace("-", "/")
-            dt = None
-            for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y", "%Y-%m-%d"):
+    # If issue_date still empty, try to find any dd MMM yyyy anywhere
+    if not out["issue_date"]:
+        for ln in lines[:20]:
+            m = re.search(r"([0-3]?\d\s+[A-Za-z]{3,9}\s+\d{4})", ln)
+            if m:
                 try:
-                    dt = datetime.strptime(possible, fmt)
+                    dt = datetime.strptime(m.group(1), "%d %b %Y")
+                    out["issue_date"] = dt.strftime("%Y-%m-%d")
                     break
-                except:
-                    pass
-            if dt:
-                out["issue_date"] = dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
+                except Exception:
+                    out["issue_date"] = m.group(1)
+                    break
 
     return out
 
