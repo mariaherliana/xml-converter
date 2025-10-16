@@ -83,11 +83,7 @@ def pad_npwp_to_22(npwp_raw: str) -> str:
     return digits.zfill(22)
 
 def extract_fields_from_text(text: str) -> dict:
-    """
-    Given extracted PDF text (single string), attempt to parse required fields.
-    This is tuned for the invoice layout you provided. If not found, leave blank.
-    Fields to extract: buyer name, buyer address (multi-line capture), NPWP, issue date, invoice no, subtotal (DPP), VAT, total amount
-    """
+    """Parse key invoice fields from text-based PDF invoices with stable label layout."""
     out = {
         "buyer_name": "",
         "buyer_address": "",
@@ -96,37 +92,60 @@ def extract_fields_from_text(text: str) -> dict:
         "invoice_no": "",
         "subtotal": None,
         "vat": None,
-        "total": None
+        "total": None,
     }
 
-    # Normalize spaces
-    t = re.sub(r"\r", "\n", text)
-    t = re.sub(r"\n\s+\n", "\n\n", t)
-    # try to find "To :" block or buyer name uppercase line near top
-    # Buyer name shown in screenshot (bold uppercase) - attempt to find line starting with uppercase words > 3 letters
-    lines = [l.strip() for l in t.splitlines() if l.strip()]
-    # find "To" or "To :" and then next lines
-    for i, ln in enumerate(lines):
-        if re.search(r"^To\s*:?", ln, re.IGNORECASE):
-            # Next non-empty lines might include buyer name and address
-            if i+1 < len(lines):
-                out["buyer_name"] = lines[i+1]
-                # capture next few lines as address until we hit a numeric line containing NPWP or phone or "NPWP/NIK"
-                addr_lines = []
-                for j in range(i+2, min(i+8, len(lines))):
-                    l2 = lines[j]
-                    if re.search(r"NPWP|NIK|NPWP\/NIK|NPWP\s*:|Invoice|Issue Date|Tanggal", l2, re.IGNORECASE):
-                        break
-                    addr_lines.append(l2)
-                out["buyer_address"] = " ".join(addr_lines).strip()
-            break
+    # normalize
+    t = re.sub(r"\s+", " ", text)
 
-    # If still empty buyer name, fallback: first very uppercase line with > 2 words
-    if not out["buyer_name"]:
-        for ln in lines[:8]:
-            if ln.isupper() and len(ln.split()) >= 2:
-                out["buyer_name"] = ln
-                break
+    # invoice number
+    m = re.search(r"Invoice\s*(?:No|#)[:\s]+([A-Za-z0-9\-\(\)\._\/]+)", t, re.IGNORECASE)
+    if m:
+        out["invoice_no"] = m.group(1).strip()
+
+    # issue date
+    m = re.search(r"(?:Issue\s*Date|Tanggal\s*Faktur)[:\s]+([0-3]?\d\s*[A-Za-z]{3,9}\s*\d{4})", t, re.IGNORECASE)
+    if m:
+        raw_date = m.group(1).strip()
+        try:
+            dt = datetime.strptime(raw_date, "%d %b %Y")
+        except Exception:
+            try:
+                dt = datetime.strptime(raw_date, "%d %B %Y")
+            except Exception:
+                dt = None
+        out["issue_date"] = dt.strftime("%Y-%m-%d") if dt else raw_date
+
+    # buyer name
+    m = re.search(r"To[:\s]+([A-Z0-9\s\.\,&\-]+?)(?=\s+NPWP|Alamat|Issue|Invoice|No|Tanggal|$)", t, re.IGNORECASE)
+    if m:
+        out["buyer_name"] = m.group(1).strip()
+
+    # NPWP
+    m = re.search(r"NPWP[:\s]*([0-9\.\-]+)", t, re.IGNORECASE)
+    if m:
+        raw_npwp = re.sub(r"\D", "", m.group(1))  # strip non-digits
+        # ensure at least 16 digits by left-padding with zeros
+        if len(raw_npwp) < 16:
+            raw_npwp = raw_npwp.zfill(16)
+        out["npwp"] = raw_npwp
+
+    # Subtotal / DPP
+    m = re.search(r"(?:Sub\s*Total|Subtotal)[:\s]*([0-9\.,]+)", t, re.IGNORECASE)
+    if m:
+        out["subtotal"] = clean_number(m.group(1))
+
+    # VAT
+    m = re.search(r"(?:VAT|PPN)[:\s]*([0-9\.,]+)", t, re.IGNORECASE)
+    if m:
+        out["vat"] = clean_number(m.group(1))
+
+    # Total
+    m = re.search(r"Total[:\s]*([0-9\.,]+)", t, re.IGNORECASE)
+    if m:
+        out["total"] = clean_number(m.group(1))
+
+    return out
 
     # NPWP: search for long digit sequences (10-22 digits)
     npwp_match = None
