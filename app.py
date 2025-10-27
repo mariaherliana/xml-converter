@@ -1,452 +1,345 @@
 # app.py
-import streamlit as st
-import pdfplumber
 import re
-import pandas as pd
 import io
+import datetime
+import base64
+from typing import List, Dict, Any
+
+import streamlit as st
+import pandas as pd
+import pdfplumber
+from supabase import create_client
+from dotenv import load_dotenv
 import os
-from datetime import datetime
-import xml.etree.ElementTree as ET
 
-# ------------------------
-# Config / defaults
-# ------------------------
-SELLER_ID_TKU_DEFAULT = "0618595813012000000000"  # ID TKU Penjual (22 digits default)
-Faktur_columns = [
-    "Baris", "Jenis Faktur", "Kode Transaksi", "ID TKU Penjual", "Jenis ID Pembeli",
-    "Negara Pembeli", "Email Pembeli", "ID TKU Pembeli", "Nama Pembeli", "Alamat Pembeli",
-    "NPWP Pembeli", "Tanggal Faktur", "Invoice No", "Referensi", "Total Amount", "DPP", "PPN"
-]
-DetailFaktur_columns = [
-    "Baris", "Barang/Jasa", "Kode Barang Jasa", "Nama Barang/Jasa", "Nama Satuan Ukur",
-    "Harga Satuan", "Jumlah Barang Jasa", "Total Diskon", "DPP", "DPP Nilai Lain",
-    "Tarif PPN", "PPN", "Tarif PPnBM", "PPnBM"
-]
+load_dotenv()
 
-# ------------------------
-# Helpers
-# ------------------------
-def clean_number(text: str) -> float:
+# -----------------------
+# Config / Supabase
+# -----------------------
+SUPABASE_URL = st.secrets["SUPABASE"]["URL"] if "SUPABASE" in st.secrets else os.getenv("SUPABASE_URL")
+SUPABASE_KEY = st.secrets["SUPABASE"]["KEY"] if "SUPABASE" in st.secrets else os.getenv("SUPABASE_KEY")
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
+
+# -----------------------
+# Palette / Theme colors
+# -----------------------
+PALETTE = {
+    "primary": "#E2A16F",  # warm tan
+    "bg_light": "#FFF0DD",
+    "muted": "#D1D3D4",
+    "accent": "#86B0BD"    # blueish
+}
+
+st.set_page_config(page_title="Coretax PDF Extractor", layout="wide",
+                   initial_sidebar_state="expanded")
+
+# Minimal theming via CSS using palette
+st.markdown(
+    f"""
+    <style>
+    .stApp {{ background-color: {PALETTE['bg_light']} }}
+    .header {{ background-color: {PALETTE['primary']}; padding: 10px; border-radius: 8px; color: white }}
+    .stButton>button {{ background-color: {PALETTE['accent']}; color: white; border: none }}
+    .reset-btn .stButton>button {{ background-color: #999; color: white }}
+    table.dataframe tbody tr:hover {{ background-color: {PALETTE['muted']} }}
+    </style>
+    """, unsafe_allow_html=True)
+
+# -----------------------
+# Helper extraction functions
+# -----------------------
+def parse_date_from_text(text: str) -> str:
     """
-    Convert number string like '762.300' or '830.907' or '762,300.00' into float.
-    Handles thousands separator as dot or comma. Assumes decimal separator is either '.' with no thousands or ',' as thousands.
+    Looks for lines like:
+    'KOTA ADM. JAKARTA SELATAN, 30 September 2025'
+    Returns DD/MM/YYYY or empty string.
     """
-    if text is None:
-        return None
-    s = str(text).strip()
-    # remove currency symbols and spaces
-    s = re.sub(r"[^\d,.\-]", "", s)
-    if s == "":
-        return None
-    # If both comma and dot: assume dot is thousands separator when comma present as decimal? we'll normalize:
-    # Common Indonesian formatting: "762.300" meaning 762300 (no decimals). If there is a comma as decimals, handle it.
-    if s.count(".") > 0 and s.count(",") == 0:
-        # remove dots (thousands) -> integer
-        s2 = s.replace(".", "")
+    # common pattern: , <day> <MonthName> <year>
+    m = re.search(r",\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
+    if m:
+        day, mon_name, year = m.group(1), m.group(2), m.group(3)
         try:
-            return float(s2)
-        except:
-            return None
-    if s.count(",") > 0 and s.count(".") == 0:
-        # maybe "1,234" meaning 1234 -> remove commas
-        s2 = s.replace(",", "")
-        try:
-            return float(s2)
-        except:
-            return None
-    # if both present, treat comma as thousands and dot as decimal OR vice versa — try a couple heuristics
-    if s.count(",") > 0 and s.count(".") > 0:
-        # heuristic: if last separator is comma, comma is decimal -> replace '.' thousands, ',' decimal
-        if s.rfind(",") > s.rfind("."):
-            s2 = s.replace(".", "").replace(",", ".")
+            dt = datetime.datetime.strptime(f"{day} {mon_name} {year}", "%d %B %Y")
+        except ValueError:
+            # try English month
             try:
-                return float(s2)
-            except:
-                pass
-        # else last sep is dot -> remove commas, keep dot as decimal
-        s2 = s.replace(",", "")
-        try:
-            return float(s2)
-        except:
-            pass
-    # fallback
-    try:
-        return float(s)
-    except:
-        return None
+                dt = datetime.datetime.strptime(f"{day} {mon_name} {year}", "%d %b %Y")
+            except Exception:
+                return ""
+        return dt.strftime("%d/%m/%Y")
+    return ""
 
-def pad_npwp_to_22(npwp_raw: str) -> str:
-    if not npwp_raw:
-        return ""
-    digits = re.sub(r"\D", "", npwp_raw)
-    # pad left with zeros until length 22
-    return digits.zfill(22)
-
-def extract_fields_from_text(text: str) -> dict:
+def parse_kode_seri_type(text: str) -> Dict[str,str]:
     """
-    Improved, line-oriented extractor for your fixed-layout, text-based invoices.
-    Returns dict with keys:
-      buyer_name, buyer_address, npwp, issue_date, invoice_no, subtotal, vat, total
+    Find 'Kode dan Nomor Seri Faktur Pajak: 0400250031...' -> get first 3 digits
+    If starts with 040 => Normal else Pembetulan
     """
-    out = {
-        "buyer_name": "",
-        "buyer_address": "",
-        "npwp": "",
-        "issue_date": "",
-        "invoice_no": "",
-        "subtotal": None,
-        "vat": None,
-        "total": None
-    }
-
-    # Make sure we preserve lines, remove trailing/leading spaces
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    # unify some known label variants (lowercase copy for searching)
-    low_lines = [ln.lower() for ln in lines]
-
-    # --- Helper local functions ---
-    def find_line_containing(key_variants):
-        """Return first index of a line containing any of the key_variants (case-insensitive)."""
-        for idx, l in enumerate(low_lines):
-            for k in key_variants:
-                if k in l:
-                    return idx
-        return None
-
-    def extract_after_label(line, label_regex):
-        """Try to extract value after label within the same line using label_regex with a capture group."""
-        m = re.search(label_regex, line, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            return val
-        return None
-
-    # --- Invoice No ---
-    idx = find_line_containing(["invoice no", "invoice no:", "invoice#", "invoice #", "invoice"])
-    if idx is not None:
-        # try same-line extraction
-        val = extract_after_label(lines[idx], r"(?:invoice\s*(?:no|#)\s*[:\-]?\s*)(.+)$")
-        if not val:
-            # maybe "Invoice" then number on same line separated by spaces
-            parts = lines[idx].split()
-            if len(parts) > 1:
-                val = " ".join(parts[1:])
-        if val:
-            out["invoice_no"] = val.strip()
-
-    # --- Issue Date / Tanggal Faktur ---
-    idx = find_line_containing(["issue date", "tanggal faktur", "issue date:"])
-    if idx is not None:
-        # try same line first
-        val = extract_after_label(lines[idx], r"(?:issue\s*date|tanggal\s*faktur)\s*[:\-]?\s*(.+)$")
-        if not val and idx+1 < len(lines):
-            # maybe value on next line
-            val = lines[idx+1].strip()
-        if val:
-            # normalize date like '07 Oct 2025' to 'YYYY-MM-DD' if possible
-            raw = val
-            parsed = None
-            for fmt in ("%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-                try:
-                    parsed = datetime.strptime(raw, fmt)
-                    break
-                except Exception:
-                    pass
-            out["issue_date"] = parsed.strftime("%Y-%m-%d") if parsed else raw
-
-    # --- Buyer name and address ---
-    # Preferred anchor: a line that starts with "To" or "To :"
-    idx = find_line_containing(["to :", "to:", "to "])
-    if idx is not None:
-        # buyer name may be on same line after "To:" or on next line
-        val = extract_after_label(lines[idx], r"to\s*[:\-]?\s*(.+)$")
-        if val:
-            out["buyer_name"] = val.strip()
-            # address follows starting at next line until we hit NPWP, Invoice, or blank
-            addr_lines = []
-            j = idx + 1
-            while j < len(lines):
-                l = lines[j]
-                if re.search(r"npwp|invoice|issue date|tanggal|total|vat|ppn", l, re.IGNORECASE):
-                    break
-                addr_lines.append(l)
-                j += 1
-            out["buyer_address"] = " ".join(addr_lines).strip()
+    m = re.search(r"Kode dan Nomor Seri Faktur Pajak[:\s]+([0-9A-Za-z\-]+)", text)
+    if m:
+        code = m.group(1).strip()
+        prefix = code[:3]
+        if prefix == "040":
+            ftype = "Normal"
         else:
-            # if "To" line only, next line likely buyer name
-            if idx+1 < len(lines):
-                out["buyer_name"] = lines[idx+1].strip()
-                # address from idx+2 until NPWP or label
-                addr_lines = []
-                j = idx + 2
-                while j < len(lines):
-                    l = lines[j]
-                    if re.search(r"npwp|invoice|issue date|tanggal|total|vat|ppn", l, re.IGNORECASE):
-                        break
-                    addr_lines.append(l)
-                    j += 1
-                out["buyer_address"] = " ".join(addr_lines).strip()
+            ftype = "Pembetulan"
+        return {"raw_code": code, "type": ftype}
+    return {"raw_code": "", "type": ""}
+
+def parse_reference(text: str) -> str:
+    # look for (Referensi: something) or Referensi: something
+    m = re.search(r"Referensi[:\s]*([A-Za-z0-9\-\_\/]+)", text)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"\(Referensi:\s*([^\)]+)\)", text)
+    if m2:
+        return m2.group(1).strip()
+    return ""
+
+def extract_buyer_block(text: str) -> str:
+    """Return the textual block for 'Pembeli Barang Kena Pajak' section (approx)."""
+    # crude approach: find 'Pembeli Barang Kena Pajak' then take next 400-800 chars
+    m = re.search(r"(Pembeli Barang Kena Pajak\/Penerima Jasa Kena Pajak:.*?)(?:\n\n|\Z)", text, re.S)
+    if m:
+        return m.group(1)
+    # fallback: search for 'Pembeli Barang' and take chunk
+    m2 = re.search(r"Pembeli Barang.*", text, re.S)
+    if m2:
+        start = m2.start()
+        return text[start:start+800]
+    return ""
+
+def parse_buyer_fields(text: str) -> Dict[str,str]:
+    b = extract_buyer_block(text)
+    result = {"buyer_npwp":"", "buyer_name":"", "buyer_address":"", "buyer_email":"", "buyer_id_tku":""}
+    # NPWP : digits
+    m = re.search(r"NPWP\s*[:]\s*([0-9]{15,20})", b)
+    if m:
+        result["buyer_npwp"] = m.group(1).strip()
+    # Name
+    m = re.search(r"Nama\s*[:]\s*([^\n\r]+)", b)
+    if m:
+        result["buyer_name"] = m.group(1).strip()
+    # Alamat
+    m = re.search(r"Alamat\s*[:]\s*([^\n\r\(]+(?:\n[^\n\r]+)?)", b)
+    if m:
+        addr = m.group(1).strip()
+        # remove trailing NPWP if present at same line or following
+        result["buyer_address"] = re.sub(r"\s*NPWP.*", "", addr).strip()
     else:
-        # fallback: first fully uppercase line that looks like a company name (avoid "INVOICE" etc.)
-        for ln in lines[:10]:
-            if ln.isupper() and len(ln) > 3 and not re.search(r"invoice|revcomm|to", ln, re.IGNORECASE):
-                out["buyer_name"] = ln
-                break
+        # try to capture full address by taking up to NPWP line
+        m2 = re.search(r"Alamat\s*[:]\s*(.*?)\nNPWP", b, re.S)
+        if m2:
+            result["buyer_address"] = " ".join([ln.strip() for ln in m2.group(1).splitlines()]).strip()
+    # Email
+    m = re.search(r"Email[:\s]*([A-Za-z0-9\.\-_]+@[A-Za-z0-9\.\-]+)", b)
+    if m:
+        result["buyer_email"] = m.group(1).strip()
+    # Buyer ID TKU: find '#' followed by digits in address line
+    m = re.search(r"#\s*([0-9]{8,30})", b)
+    if m:
+        result["buyer_id_tku"] = m.group(1).strip()
+    return result
 
-    # --- NPWP (must be 16 digits left-padded with zero if shorter) ---
-    idx = find_line_containing(["npwp", "npwp/nik", "npwp :"])
-    if idx is not None:
-        # try same-line capture
-        val = extract_after_label(lines[idx], r"npwp(?:\/nik)?\s*[:\-]?\s*([0-9\.\- ]+)")
-        if not val and idx+1 < len(lines):
-            # maybe next line contains the digits
-            val = lines[idx+1].strip()
-        if val:
-            digits = re.sub(r"\D", "", val)
-            if len(digits) < 16:
-                digits = digits.zfill(16)
-            out["npwp"] = digits
-    else:
-        # fallback: search for a long digit sequence anywhere (common NPWP patterns)
-        for ln in lines:
-            m = re.search(r"(\d{8,16})", re.sub(r"\s", "", ln))
-            if m:
-                digits = m.group(1)
-                if len(digits) < 16:
-                    digits = digits.zfill(16)
-                out["npwp"] = digits
-                break
-
-    # --- Monetary amounts: Subtotal/DPP, VAT/PPN, Total ---
-    # Search bottom-up for labels because amounts usually placed near bottom
-    for i in range(len(lines)-1, -1, -1):
-        ln = lines[i]
-        low = low_lines[i]
-        # subtotal / DPP
-        if out["subtotal"] is None and re.search(r"sub\s*total|subtotal|harga satuan, dpp|sub total", low):
-            m = re.search(r"([0-9\.,]+)", ln)
-            if m:
-                out["subtotal"] = clean_number(m.group(1))
+def extract_goods_and_dpp(text: str) -> List[Dict[str,Any]]:
+    """
+    Extract lines under the "Nama Barang Kena Pajak / Jasa Kena Pajak" and the price column.
+    This is heuristic: find the table area and parse each item block.
+    """
+    # We'll search for the table header then grab following lines until summary area like "Dasar Pengenaan Pajak"
+    m = re.search(r"Nama Barang Kena Pajak\s*\/\s*Jasa Kena Pajak(.*?)(?:Dasar Pengenaan Pajak|Jumlah PPN)", text, re.S|re.I)
+    items = []
+    if m:
+        block = m.group(1)
+        # Items are often numbered: "1 000000\n\nCall fee\nRp 762.300,00 x 1,00"
+        # Split by lines that start with a digit number and possibly space
+        parts = re.split(r"\n(?=\s*\d+\s+)", block)
+        for p in parts:
+            # name: first non-empty line
+            lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
+            if not lines:
                 continue
-        # VAT / PPN
-        if out["vat"] is None and re.search(r"\b(vat|ppn)\b", low):
-            m = re.search(r"([0-9\.,]+)", ln)
-            if m:
-                out["vat"] = clean_number(m.group(1))
-                continue
-        # total / total amount
-        if out["total"] is None and re.search(r"\b(total amount|total)\b", low):
-            m = re.search(r"([0-9\.,]+)", ln)
-            if m:
-                out["total"] = clean_number(m.group(1))
-                # try to find subtotal if it's just above
-                if out["subtotal"] is None and i-1 >= 0:
-                    m2 = re.search(r"([0-9\.,]+)", lines[i-1])
-                    if m2:
-                        out["subtotal"] = clean_number(m2.group(1))
-                continue
-
-    # final fallback heuristics if any are still None
-    if out["subtotal"] is None:
-        # try to find first large numeric-looking value in the items region
-        for ln in lines:
-            m = re.search(r"([0-9]{1,3}(?:[.,]\d{3})+)", ln)
-            if m:
-                out["subtotal"] = clean_number(m.group(1))
-                break
-
-    # If issue_date still empty, try to find any dd MMM yyyy anywhere
-    if not out["issue_date"]:
-        for ln in lines[:20]:
-            m = re.search(r"([0-3]?\d\s+[A-Za-z]{3,9}\s+\d{4})", ln)
-            if m:
+            # find a line that looks like a currency: 'Rp 762.300,00' or ends with numbers and comma
+            price = ""
+            name = lines[0]
+            # try to locate price inside lines
+            for ln in lines:
+                mprice = re.search(r"Rp\s*([\d\.\,]+)", ln)
+                if mprice:
+                    price = mprice.group(1).strip()
+                    break
+            # convert price to plain number
+            price_num = None
+            if price:
+                price_num = price.replace(".", "").replace(",", ".")
                 try:
-                    dt = datetime.strptime(m.group(1), "%d %b %Y")
-                    out["issue_date"] = dt.strftime("%Y-%m-%d")
-                    break
-                except Exception:
-                    out["issue_date"] = m.group(1)
-                    break
+                    price_num = float(price_num)
+                except:
+                    price_num = None
+            items.append({"goods_service": name, "dpp": price_num, "dpp_raw": price})
+    return items
 
-    return out
-
-def pdf_to_text(file_bytes: bytes) -> str:
+def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            text += page.extract_text() or ""
-            text += "\n"
+            page_text = page.extract_text() or ""
+            text += page_text + "\n"
     return text
 
-def build_excel_and_xml(parsed_rows: list):
-    """
-    parsed_rows: list of dicts with keys:
-      buyer_name, buyer_address, npwp, issue_date, invoice_no, subtotal, vat, total
-    Returns bytes for excel and xml
-    """
-    faktur_rows = []
-    detail_rows = []
+# -----------------------
+# UI
+# -----------------------
+st.markdown('<div class="header"><h2>Coretax PDF (Faktur) Extractor</h2></div>', unsafe_allow_html=True)
+st.write("Upload one or multiple Coretax-format Faktur Pajak PDFs. Note: app expects Coretax layout.")
 
-    for idx, r in enumerate(parsed_rows, start=1):
-        # Faktur row mapping
-        buyer_tin_padded = pad_npwp_to_22(r.get("npwp", ""))
-        faktur_row = {
-            "Baris": idx,
-            "Jenis Faktur": "Normal",
-            "Kode Transaksi": "04",
-            "ID TKU Penjual": SELLER_ID_TKU_DEFAULT,
-            "Jenis ID Pembeli": "TIN",
-            "Negara Pembeli": "IDN",
-            "Email Pembeli": "",
-            "ID TKU Pembeli": buyer_tin_padded,
-            "Nama Pembeli": r.get("buyer_name", ""),
-            "Alamat Pembeli": r.get("buyer_address", ""),
-            "NPWP Pembeli": r.get("npwp", ""),
-            "Tanggal Faktur": r.get("issue_date", ""),
-            "Invoice No": r.get("invoice_no", ""),
-            "Referensi": "",
-            "Total Amount": int(round(r.get("total", 0))) if r.get("total") is not None else "",
-            "DPP": int(round(r.get("subtotal", 0))) if r.get("subtotal") is not None else "",
-            "PPN": int(round(r.get("vat", 0))) if r.get("vat") is not None else ""
-        }
-        faktur_rows.append(faktur_row)
+# top small controls
+col1, col2, col3 = st.columns([2,1,1])
+with col1:
+    st.markdown("**Actions**")
+    st.markdown("- Upload Coretax PDFs\n- Click *Extract* to parse and log to Supabase\n- Download results as CSV/XLSX")
+with col2:
+    st.markdown("**Download template**")
+    st.markdown("[Download Faktur Pajak Keluaran Excel template](https://pajak.go.id/sites/default/files/2025-03/Sample%20Faktur%20PK%20Template%20v.1.4.xml.zip)")
+with col3:
+    st.markdown("**Pages**")
+    page = st.selectbox("", ["Extractor", "XML Converter (placeholder)"])
 
-        # DetailFaktur fields and calculations:
-        dpp = r.get("subtotal") or 0.0
-        # DPP Nilai Lain = ROUND((11/12) * DPP)
-        dpp_nilai_lain = round((11.0/12.0) * dpp)
-        # PPN = ROUND(DPP Nilai Lain * 12%)
-        ppn = round(dpp_nilai_lain * 0.12)
-
-        detail_row = {
-            "Baris": idx,
-            "Barang/Jasa": "B",
-            "Kode Barang Jasa": "000000",
-            "Nama Barang/Jasa": "MiiTel Subscription",
-            "Nama Satuan Ukur": "UM.0033",
-            "Harga Satuan": int(round(r.get("subtotal", 0))) if r.get("subtotal") is not None else "",
-            "Jumlah Barang Jasa": 1,
-            "Total Diskon": 0,
-            "DPP": int(round(dpp)),
-            "DPP Nilai Lain": int(dpp_nilai_lain),
-            "Tarif PPN": 12,
-            "PPN": int(ppn),
-            "Tarif PPnBM": 0,
-            "PPnBM": 0
-        }
-        detail_rows.append(detail_row)
-
-    # Build Excel in-memory
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df_faktur = pd.DataFrame(faktur_rows, columns=Faktur_columns)
-        df_detail = pd.DataFrame(detail_rows, columns=DetailFaktur_columns)
-        df_faktur.to_excel(writer, sheet_name="Faktur", index=False)
-        df_detail.to_excel(writer, sheet_name="DetailFaktur", index=False)
-        writer.save()
-    excel_bytes = out.getvalue()
-
-    # Build XML following your TaxInvoiceBulk template structure
-    root = ET.Element("TaxInvoiceBulk", {
-        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
-        "xsi:noNamespaceSchemaLocation": "TaxInvoice.xsd"
-    })
-    # Use seller TIN as TIN element (trim/format if necessary)
-    tin_elem = ET.SubElement(root, "TIN")
-    tin_elem.text = SELLER_ID_TKU_DEFAULT
-
-    list_elem = ET.SubElement(root, "ListOfTaxInvoice")
-    for fr, dr in zip(faktur_rows, detail_rows):
-        inv = ET.SubElement(list_elem, "TaxInvoice")
-        # minimal mapping
-        ET.SubElement(inv, "TaxInvoiceDate").text = fr.get("Tanggal Faktur", "")
-        ET.SubElement(inv, "TaxInvoiceOpt").text = fr.get("Jenis Faktur", "Normal")
-        ET.SubElement(inv, "TrxCode").text = fr.get("Kode Transaksi", "04")
-        ET.SubElement(inv, "AddInfo").text = ""
-        ET.SubElement(inv, "CustomDoc").text = ""
-        ET.SubElement(inv, "RefDesc").text = ""
-        ET.SubElement(inv, "FacilityStamp").text = ""
-        ET.SubElement(inv, "SellerIDTKU").text = fr.get("ID TKU Penjual")
-        ET.SubElement(inv, "BuyerTin").text = fr.get("ID TKU Pembeli")
-        ET.SubElement(inv, "BuyerDocument").text = fr.get("Jenis ID Pembeli")
-        ET.SubElement(inv, "BuyerCountry").text = fr.get("Negara Pembeli")
-        ET.SubElement(inv, "BuyerDocumentNumber").text = fr.get("NPWP Pembeli", "")
-        ET.SubElement(inv, "BuyerName").text = fr.get("Nama Pembeli", "")
-        ET.SubElement(inv, "BuyerAdress").text = fr.get("Alamat Pembeli", "")
-        ET.SubElement(inv, "BuyerEmail").text = fr.get("Email Pembeli", "")
-        ET.SubElement(inv, "BuyerIDTKU").text = fr.get("ID TKU Pembeli", "")
-        # List of GoodService
-        list_gs = ET.SubElement(inv, "ListOfGoodService")
-        gs = ET.SubElement(list_gs, "GoodService")
-        ET.SubElement(gs, "Opt").text = dr.get("Barang/Jasa", "B")
-        ET.SubElement(gs, "Code").text = dr.get("Kode Barang Jasa", "000000")
-        ET.SubElement(gs, "Name").text = dr.get("Nama Barang/Jasa", "MiiTel Subscription")
-        ET.SubElement(gs, "Unit").text = dr.get("Nama Satuan Ukur", "UM.0033")
-        ET.SubElement(gs, "Price").text = str(dr.get("Harga Satuan", ""))
-        ET.SubElement(gs, "Qty").text = str(dr.get("Jumlah Barang Jasa", 1))
-        ET.SubElement(gs, "TotalDiscount").text = str(dr.get("Total Diskon", 0))
-        ET.SubElement(gs, "TaxBase").text = str(dr.get("DPP", ""))
-        ET.SubElement(gs, "OtherTaxBase").text = str(dr.get("DPP Nilai Lain", ""))
-        ET.SubElement(gs, "VATRate").text = str(dr.get("Tarif PPN", 12))
-        ET.SubElement(gs, "VAT").text = str(dr.get("PPN", ""))
-        ET.SubElement(gs, "STLGRate").text = str(dr.get("Tarif PPnBM", 0))
-        ET.SubElement(gs, "STLG").text = str(dr.get("PPnBM", 0))
-
-    # pretty print xml bytes
-    xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    return excel_bytes, xml_bytes
-
-# ------------------------
-# Streamlit UI
-# ------------------------
-st.set_page_config(page_title="Invoice → Excel & XML (bulk)", layout="wide")
-st.title("Invoice Bulk Converter — PDF → Excel & XML")
-st.info("Upload invoices (PDF) exported using the standard template. The tool will extract fields and produce one Excel and one XML file for download.")
-
-uploaded_files = st.file_uploader("Upload invoice PDFs (multiple allowed)", type=["pdf"], accept_multiple_files=True)
-
-if uploaded_files:
-    st.write(f"Received {len(uploaded_files)} files — parsing now...")
-    parsed = []
-    progress = st.progress(0)
-    for i, up in enumerate(uploaded_files, start=1):
-        try:
-            raw = up.read()
-            text = pdf_to_text(raw)
-            fields = extract_fields_from_text(text)
-            # for traceability, attach filename as invoice_no fallback
-            if not fields.get("invoice_no"):
-                fields["invoice_no"] = os.path.splitext(up.name)[0]
-            parsed.append(fields)
-            progress.progress(int(i/len(uploaded_files)*100))
-        except Exception as e:
-            st.warning(f"Failed to parse {up.name}: {e}")
-            parsed.append({
-                "buyer_name": "",
-                "buyer_address": "",
-                "npwp": "",
-                "issue_date": "",
-                "invoice_no": os.path.splitext(up.name)[0],
-                "subtotal": None,
-                "vat": None,
-                "total": None
-            })
-
-    st.success("Parsing complete. Preview extracted fields:")
-    preview_df = pd.DataFrame(parsed)
-    st.dataframe(preview_df)
-
-    if st.button("Generate Excel & XML"):
-        with st.spinner("Building Excel and XML..."):
-            excel_bytes, xml_bytes = build_excel_and_xml(parsed)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            excel_name = f"faktur_bulk_{ts}.xlsx"
-            xml_name = f"taxinvoice_bulk_{ts}.xml"
-
-            st.download_button("⬇️ Download Excel (Faktur + DetailFaktur)", data=excel_bytes, file_name=excel_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.download_button("⬇️ Download XML (TaxInvoiceBulk)", data=xml_bytes, file_name=xml_name, mime="application/xml")
-            st.success("Files ready for download. Review the Excel for any missing / mis-parsed fields before submitting elsewhere.")
+if page != "XML Converter (placeholder)":
+    uploaded = st.file_uploader("Upload Coretax PDF(s)", type=["pdf"], accept_multiple_files=True)
 else:
-    st.info("Upload one or more invoice PDFs to begin.")
+    st.info("XML Converter page — placeholder. We'll implement this later.")
+    uploaded = []
 
-st.markdown("<small>Note: this extractor assumes identical invoice layout. If some fields are wrongly parsed, open the generated Excel and correct manually — the XML is generated from the Excel-style rows.</small>", unsafe_allow_html=True)
+st.checkbox("I confirm these are Coretax-format Faktur Pajak PDFs", value=False, key="confirm_coretax")
+
+# Session storage for results
+if "results_df" not in st.session_state:
+    st.session_state["results_df"] = None
+if "last_log_id" not in st.session_state:
+    st.session_state["last_log_id"] = None
+
+extract_col, reset_col = st.columns([1,1])
+with extract_col:
+    extract_btn = st.button("Extract", key="extract_btn")
+with reset_col:
+    reset_btn = st.button("Reset (clear uploads & results)", key="reset_btn")
+
+if reset_btn:
+    st.session_state["results_df"] = None
+    st.session_state["last_log_id"] = None
+    st.experimental_rerun()
+
+if extract_btn:
+    if not uploaded:
+        st.warning("Please upload at least one Coretax PDF before extracting.")
+    else:
+        if not st.session_state.get("confirm_coretax", False):
+            st.warning("Please confirm the files are Coretax-format PDFs.")
+        else:
+            rows = []
+            for f in uploaded:
+                raw = f.read()
+                text = extract_text_from_pdf_bytes(raw)
+                date = parse_date_from_text(text)
+                kode_info = parse_kode_seri_type(text)
+                reference = parse_reference(text)
+                buyer = parse_buyer_fields(text)
+                goods = extract_goods_and_dpp(text)
+                # If goods empty, create fallback single row with blank goods
+                if not goods:
+                    goods = [{"goods_service":"", "dpp": None, "dpp_raw": ""}]
+
+                # For each goods/service produce a row
+                for g in goods:
+                    row = {
+                        "source_filename": f.name,
+                        "date": date,
+                        "facture_type": kode_info.get("type"),
+                        "kode_seri_raw": kode_info.get("raw_code"),
+                        "reference": reference,
+                        "buyer_npwp": buyer.get("buyer_npwp"),
+                        "buyer_name": buyer.get("buyer_name"),
+                        "buyer_address": buyer.get("buyer_address"),
+                        "buyer_email": buyer.get("buyer_email"),
+                        "buyer_id_tku": buyer.get("buyer_id_tku"),
+                        "goods_service": g.get("goods_service"),
+                        "dpp": g.get("dpp"),
+                        "dpp_raw": g.get("dpp_raw")
+                    }
+                    rows.append(row)
+
+            df = pd.DataFrame(rows)
+            st.session_state["results_df"] = df
+
+            # Log to Supabase: Processed
+            if supabase:
+                log_payload = {
+                    "processed_count": len(uploaded),
+                    "status": "Processed",
+                    "details": {"files": [f.name for f in uploaded]}
+                }
+                try:
+                    resp = supabase.table("extraction_logs").insert(log_payload).execute()
+                    # store returned id if available
+                    try:
+                        inserted = resp.data[0]
+                        st.session_state["last_log_id"] = inserted.get("id")
+                    except Exception:
+                        st.session_state["last_log_id"] = None
+                except Exception as e:
+                    st.error(f"Supabase logging failed: {e}")
+            else:
+                st.info("Supabase not configured; skipping logging.")
+
+# Show results
+if st.session_state["results_df"] is not None:
+    df = st.session_state["results_df"]
+    st.markdown("### Extraction results")
+    st.dataframe(df)
+
+    # Downloads
+    csv = df.to_csv(index=False).encode("utf-8")
+    xlsx_buffer = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="extraction")
+    xlsx_data = xlsx_buffer.getvalue()
+
+    col_a, col_b, col_c = st.columns([1,1,1])
+    with col_a:
+        st.download_button("Download CSV", data=csv, file_name="extraction.csv", mime="text/csv")
+    with col_b:
+        st.download_button("Download XLSX", data=xlsx_data, file_name="extraction.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with col_c:
+        # Copy as plain text to clipboard is browser-level; provide a textarea for manual copy
+        st.text_area("Copy results (select all to copy):", value=df.to_csv(sep="\t", index=False), height=120)
+
+    # If user downloads — we try to update Supabase status to Downloaded.
+    # Note: Streamlit's download button cannot give a callback event when click completes.
+    # We provide a manual "Mark Downloaded" button to update the log.
+    if st.session_state.get("last_log_id"):
+        if st.button("Mark as Downloaded (update log)"):
+            if supabase:
+                try:
+                    supabase.table("extraction_logs").update({"status":"Downloaded"}).eq("id", st.session_state["last_log_id"]).execute()
+                    st.success("Log updated to Downloaded.")
+                except Exception as e:
+                    st.error(f"Failed to update log: {e}")
+            else:
+                st.info("Supabase not configured; cannot update log.")
+
+# Footer / notes
+st.markdown("---")
+st.markdown("**Notes & assumptions**")
+st.markdown("""
+- This tool expects Coretax layout PDFs (the invoice you uploaded was used to tune heuristics). Example sample used: the Akasa file you uploaded. :contentReference[oaicite:1]{index=1}  
+- Date parsing is heuristic: it looks for patterns like `, 30 September 2025` and normalizes to `DD/MM/YYYY`.  
+- Facture type is decided by the first 3 digits of `Kode dan Nomor Seri Faktur Pajak` — `040` => `Normal`, other values => `Pembetulan`.  
+- Buyer ID TKU is the numeric string that appears after `#` in the buyer address line.  
+- Goods & DPP extraction is table-heuristic-based and may need adjustments for edge cases.  
+- If you want automatic update of logs on real download events, we can implement a signed-download route (server) to capture the click; for now the app provides a manual "Mark as Downloaded" button to update Supabase.
+""")
+
