@@ -199,29 +199,19 @@ if extract_btn:
                 kode_info = parse_kode_seri_type(text)
                 reference = parse_reference(text)
                 buyer = parse_buyer_fields(text)
-                goods = extract_goods_and_dpp(text)
-                # If goods empty, create fallback single row with blank goods
-                if not goods:
-                    goods = [{"goods_service":"", "dpp": None, "dpp_raw": ""}]
-
-                # For each goods/service produce a row
-                for g in goods:
-                    row = {
-                        "source_filename": f.name,
-                        "date": date,
-                        "facture_type": kode_info.get("type"),
-                        "kode_seri_raw": kode_info.get("raw_code"),
-                        "reference": reference,
-                        "buyer_npwp": buyer.get("buyer_npwp"),
-                        "buyer_name": buyer.get("buyer_name"),
-                        "buyer_address": buyer.get("buyer_address"),
-                        "buyer_email": buyer.get("buyer_email"),
-                        "buyer_id_tku": buyer.get("buyer_id_tku"),
-                        "goods_service": g.get("goods_service"),
-                        "dpp": g.get("dpp"),
-                        "dpp_raw": g.get("dpp_raw")
-                    }
-                    rows.append(row)
+                row = {
+                    "source_filename": f.name,
+                    "date": date,
+                    "facture_type": kode_info.get("type"),
+                    "kode_seri_raw": kode_info.get("raw_code"),
+                    "reference": reference,
+                    "buyer_npwp": buyer.get("buyer_npwp"),
+                    "buyer_name": buyer.get("buyer_name"),
+                    "buyer_address": buyer.get("buyer_address"),
+                    "buyer_email": buyer.get("buyer_email"),
+                    "buyer_id_tku": buyer.get("buyer_id_tku")
+                }
+                rows.append(row)
 
             df = pd.DataFrame(rows)
             st.session_state["results_df"] = df
