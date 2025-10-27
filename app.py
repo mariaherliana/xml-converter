@@ -89,13 +89,14 @@ def parse_kode_seri_type(text: str) -> Dict[str, str]:
 
 def parse_reference(text: str) -> str:
     """
-    Captures full reference text after 'Referensi:' until newline.
+    Captures full reference text after 'Referensi:' until newline and trims trailing ).
     """
     m = re.search(r"Referensi\s*:\s*(.+)", text)
     if not m:
         return ""
     ref_line = m.group(1).strip()
     ref_line = ref_line.splitlines()[0].strip()
+    ref_line = ref_line.rstrip(")")
     return ref_line
 
 def extract_buyer_block(text: str) -> str:
@@ -131,27 +132,6 @@ def parse_buyer_fields(text: str) -> Dict[str, str]:
         result["buyer_id_tku"] = m.group(1).strip()
 
     return result
-
-def extract_goods_and_dpp(text: str) -> List[Dict[str, Any]]:
-    """
-    Extract only one line for 'Uang Muka / Termin' and its DPP value.
-    """
-    m = re.search(
-        r"Nama Barang Kena Pajak\s*/\s*Jasa Kena Pajak(.*?)Jumlah PPN",
-        text, re.S)
-    items = []
-    if m:
-        block = m.group(1)
-        g = re.search(r"(Uang Muka\s*/\s*Termin).*?Rp\s*([\d\.\,]+)", block)
-        if g:
-            goods_name = g.group(1).strip()
-            dpp_raw = g.group(2).strip()
-            try:
-                dpp_val = float(dpp_raw.replace(".", "").replace(",", "."))
-            except:
-                dpp_val = None
-            items.append({"goods_service": goods_name, "dpp": dpp_val, "dpp_raw": dpp_raw})
-    return items
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     text = ""
