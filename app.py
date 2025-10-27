@@ -11,6 +11,7 @@ import pdfplumber
 from supabase import create_client
 from dotenv import load_dotenv
 import os
+import xml.etree.ElementTree as ET
 
 load_dotenv()
 
@@ -166,9 +167,90 @@ if page != "XML Converter (placeholder)":
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.get('uploader_key', 0)}"
     )
-else:
-    st.info("XML Converter page — placeholder. We'll implement this later.")
-    uploaded = []
+elseelse:
+    st.markdown("### XML Converter")
+    st.write("Upload the Coretax Faktur Excel (format like *Sample Faktur PK Template v.1.6.xlsx*) to generate a Faktur Pajak XML file.")
+
+    xlsx_file = st.file_uploader("Upload Faktur Excel", type=["xlsx"], key="xml_converter_uploader")
+
+    if xlsx_file is not None:
+        df_faktur = pd.read_excel(xlsx_file, sheet_name="Faktur")
+        df_detail = pd.read_excel(xlsx_file, sheet_name="DetailFaktur")
+
+        st.write(f"📄 Loaded {len(df_faktur)} Faktur rows and {len(df_detail)} DetailFaktur rows")
+
+        if st.button("Convert to XML"):
+            with st.spinner("Converting XLSX to XML..."):
+                # Root element
+                root = ET.Element("TaxInvoiceBulk")
+                tin_value = str(df_faktur.get("NPWP Penjual", ["999999999999999"])[0]).strip() if "NPWP Penjual" in df_faktur.columns else "999999999999999"
+                ET.SubElement(root, "TIN").text = tin_value
+
+                list_invoices = ET.SubElement(root, "ListOfTaxInvoice")
+
+                for _, row in df_faktur.iterrows():
+                    faktur_elem = ET.SubElement(list_invoices, "TaxInvoice")
+
+                    # Basic header mapping
+                    def set_elem(parent, tag, val):
+                        if pd.notna(val) and str(val).strip() != "":
+                            ET.SubElement(parent, tag).text = str(val).strip()
+                        else:
+                            ET.SubElement(parent, tag).text = ""
+
+                    set_elem(faktur_elem, "TaxInvoiceDate", row.get("Tanggal Faktur", ""))
+                    set_elem(faktur_elem, "TaxInvoiceOpt", row.get("Jenis Faktur", "Normal"))
+                    set_elem(faktur_elem, "TrxCode", row.get("Kode Transaksi", "07"))
+                    set_elem(faktur_elem, "AddInfo", row.get("Referensi", ""))
+                    set_elem(faktur_elem, "CustomDoc", row.get("Nomor Seri Faktur", ""))
+                    set_elem(faktur_elem, "CustomDocMonthYear", row.get("Masa Pajak", ""))
+                    set_elem(faktur_elem, "RefDesc", "")
+                    set_elem(faktur_elem, "FacilityStamp", row.get("Kode Dokumen", ""))
+                    set_elem(faktur_elem, "SellerIDTKU", row.get("IDTKU Penjual", ""))
+                    set_elem(faktur_elem, "BuyerTin", row.get("NPWP Pembeli", ""))
+                    set_elem(faktur_elem, "BuyerDocument", "TIN")
+                    set_elem(faktur_elem, "BuyerCountry", "IND")
+                    set_elem(faktur_elem, "BuyerDocumentNumber", "")
+                    set_elem(faktur_elem, "BuyerName", row.get("Nama Pembeli", ""))
+                    set_elem(faktur_elem, "BuyerAdress", row.get("Alamat Pembeli", ""))
+                    set_elem(faktur_elem, "BuyerEmail", row.get("Email Pembeli", ""))
+                    set_elem(faktur_elem, "BuyerIDTKU", row.get("IDTKU Pembeli", ""))
+
+                    # Build ListOfGoodService
+                    list_goods = ET.SubElement(faktur_elem, "ListOfGoodService")
+
+                    baris = row.get("Baris")
+                    if pd.notna(baris):
+                        detail_rows = df_detail[df_detail["Baris"] == baris]
+                        for _, d in detail_rows.iterrows():
+                            goods_elem = ET.SubElement(list_goods, "GoodService")
+                            set_elem(goods_elem, "Opt", d.get("Opt", "A"))
+                            set_elem(goods_elem, "Code", d.get("Kode Barang", "000000"))
+                            set_elem(goods_elem, "Name", d.get("Nama Barang", "Barang"))
+                            set_elem(goods_elem, "Unit", d.get("Unit", "UM.0001"))
+                            set_elem(goods_elem, "Price", d.get("Harga Satuan", "0"))
+                            set_elem(goods_elem, "Qty", d.get("Jumlah", "1"))
+                            set_elem(goods_elem, "TotalDiscount", d.get("Diskon", "0"))
+                            set_elem(goods_elem, "TaxBase", d.get("DPP", "0"))
+                            set_elem(goods_elem, "OtherTaxBase", d.get("DPP", "0"))
+                            set_elem(goods_elem, "VATRate", d.get("Tarif PPN", "11"))
+                            set_elem(goods_elem, "VAT", d.get("PPN", "0"))
+                            set_elem(goods_elem, "STLGRate", d.get("Tarif PPnBM", "0"))
+                            set_elem(goods_elem, "STLG", d.get("PPnBM", "0"))
+
+                # Write XML to memory
+                xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                st.success("✅ Conversion complete!")
+
+                st.download_button(
+                    "Download XML",
+                    data=xml_bytes,
+                    file_name="FakturPajak.xml",
+                    mime="application/xml"
+                )
+
+    else:
+        st.info("Please upload a Faktur Excel file to begin conversion.")
 
 st.checkbox("I confirm these are Coretax-format Faktur Pajak PDFs", value=False, key="confirm_coretax")
 
