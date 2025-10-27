@@ -174,39 +174,50 @@ else:
     xlsx_file = st.file_uploader("Upload Faktur Excel", type=["xlsx"], key="xml_converter_uploader")
 
     if xlsx_file is not None:
-        df_faktur = pd.read_excel(xlsx_file, sheet_name="Faktur")
-        df_detail = pd.read_excel(xlsx_file, sheet_name="DetailFaktur")
+        # Read Faktur with header starting from row 3 (index 2)
+        df_faktur = pd.read_excel(xlsx_file, sheet_name="Faktur", header=2)
+        df_detail = pd.read_excel(xlsx_file, sheet_name="DetailFaktur", header=0)
+
+        # Extract NPWP Penjual (TIN) from cell B1
+        tin_value = ""
+        try:
+            df_tmp = pd.read_excel(xlsx_file, sheet_name="Faktur", header=None)
+            tin_value = str(df_tmp.iloc[0, 1]).strip() if pd.notna(df_tmp.iloc[0, 1]) else ""
+        except Exception:
+            tin_value = ""
 
         st.write(f"📄 Loaded {len(df_faktur)} Faktur rows and {len(df_detail)} DetailFaktur rows")
 
         if st.button("Convert to XML"):
             with st.spinner("Converting XLSX to XML..."):
-                # Build XML
-                root = ET.Element("TaxInvoiceBulk")
-                tin_value = str(df_faktur.get("NPWP Penjual", ["999999999999999"])[0]).strip() if "NPWP Penjual" in df_faktur.columns else "999999999999999"
-                ET.SubElement(root, "TIN").text = tin_value
+                # Build XML root with namespace
+                root = ET.Element(
+                    "TaxInvoiceBulk",
+                    attrib={
+                        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+                        "xsi:noNamespaceSchemaLocation": "TaxInvoice.xsd",
+                    },
+                )
+                ET.SubElement(root, "TIN").text = tin_value or "999999999999999"
                 list_invoices = ET.SubElement(root, "ListOfTaxInvoice")
 
                 def set_elem(parent, tag, val):
-                    if pd.notna(val) and str(val).strip() != "":
-                        ET.SubElement(parent, tag).text = str(val).strip()
-                    else:
-                        ET.SubElement(parent, tag).text = ""
+                    ET.SubElement(parent, tag).text = "" if pd.isna(val) else str(val).strip()
 
                 for _, row in df_faktur.iterrows():
                     faktur_elem = ET.SubElement(list_invoices, "TaxInvoice")
                     set_elem(faktur_elem, "TaxInvoiceDate", row.get("Tanggal Faktur", ""))
                     set_elem(faktur_elem, "TaxInvoiceOpt", row.get("Jenis Faktur", "Normal"))
-                    set_elem(faktur_elem, "TrxCode", row.get("Kode Transaksi", "07"))
+                    set_elem(faktur_elem, "TrxCode", row.get("Kode Transaksi", "04"))
                     set_elem(faktur_elem, "AddInfo", row.get("Referensi", ""))
                     set_elem(faktur_elem, "CustomDoc", row.get("Nomor Seri Faktur", ""))
-                    set_elem(faktur_elem, "CustomDocMonthYear", row.get("Masa Pajak", ""))
+                    set_elem(faktur_elem, "CustomDocMonthYear", row.get("Periode Pajak", ""))
                     set_elem(faktur_elem, "RefDesc", "")
-                    set_elem(faktur_elem, "FacilityStamp", row.get("Kode Dokumen", ""))
+                    set_elem(faktur_elem, "FacilityStamp", row.get("Dokumen", ""))
                     set_elem(faktur_elem, "SellerIDTKU", row.get("IDTKU Penjual", ""))
                     set_elem(faktur_elem, "BuyerTin", row.get("NPWP Pembeli", ""))
                     set_elem(faktur_elem, "BuyerDocument", "TIN")
-                    set_elem(faktur_elem, "BuyerCountry", "IND")
+                    set_elem(faktur_elem, "BuyerCountry", "IDN")
                     set_elem(faktur_elem, "BuyerDocumentNumber", "")
                     set_elem(faktur_elem, "BuyerName", row.get("Nama Pembeli", ""))
                     set_elem(faktur_elem, "BuyerAdress", row.get("Alamat Pembeli", ""))
@@ -233,7 +244,7 @@ else:
                             set_elem(goods_elem, "STLGRate", d.get("Tarif PPnBM", "0"))
                             set_elem(goods_elem, "STLG", d.get("PPnBM", "0"))
 
-                # Build XML bytes
+                # Convert XML to bytes (with proper declaration)
                 xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
                 st.success("✅ Conversion complete!")
 
@@ -242,7 +253,7 @@ else:
                     log_payload = {
                         "processed_count": len(df_faktur),
                         "status": "Converted",
-                        "details": {"filename": xlsx_file.name}
+                        "details": {"filename": xlsx_file.name, "type": "XML"},
                     }
                     try:
                         supabase.table("extraction_logs").insert(log_payload).execute()
