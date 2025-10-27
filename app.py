@@ -50,7 +50,7 @@ st.markdown(
     """, unsafe_allow_html=True)
 
 # -----------------------
-# Indonesian months map
+# Helper extraction functions
 # -----------------------
 MONTHS_ID = {
     "Januari": "01", "Februari": "02", "Maret": "03", "April": "04",
@@ -58,9 +58,101 @@ MONTHS_ID = {
     "September": "09", "Oktober": "10", "November": "11", "Desember": "12"
 }
 
-# -----------------------
-# Extraction functions
-# -----------------------
+def parse_date_from_text(text: str) -> str:
+    """
+    Looks for date formats like:
+    'KOTA ADM. JAKARTA SELATAN, 30 September 2025'
+    or 'Jakarta 30 September 2025'
+    Returns DD/MM/YYYY or empty string.
+    """
+    m = re.search(r"(?:,|\b)\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
+    if not m:
+        return ""
+    day, mon_name, year = m.group(1), m.group(2), m.group(3)
+    month_num = MONTHS_ID.get(mon_name.capitalize())
+    if not month_num:
+        return ""
+    return f"{int(day):02d}/{month_num}/{year}"
+
+def parse_kode_seri_type(text: str) -> Dict[str, str]:
+    """
+    Find 'Kode dan Nomor Seri Faktur Pajak: 0400250031...' -> get first 3 digits
+    If starts with 040 => Normal else Pembetulan
+    """
+    m = re.search(r"Kode dan Nomor Seri Faktur Pajak\s*:\s*([0-9A-Za-z\-]+)", text)
+    if m:
+        code = m.group(1).strip()
+        prefix = code[:3]
+        ftype = "Normal" if prefix == "040" else "Pembetulan"
+        return {"raw_code": code, "type": ftype}
+    return {"raw_code": "", "type": ""}
+
+def parse_reference(text: str) -> str:
+    """
+    Captures full reference text after 'Referensi:' until newline.
+    """
+    m = re.search(r"Referensi\s*:\s*(.+)", text)
+    if not m:
+        return ""
+    ref_line = m.group(1).strip()
+    ref_line = ref_line.splitlines()[0].strip()
+    return ref_line
+
+def extract_buyer_block(text: str) -> str:
+    """Return the text block for 'Pembeli Barang Kena Pajak / Penerima Jasa Kena Pajak' section."""
+    m = re.search(
+        r"Pembeli Barang Kena Pajak\/Penerima Jasa Kena Pajak(.*?)(?:Nama Barang Kena Pajak|Dasar Pengenaan Pajak)",
+        text, re.S)
+    return m.group(1) if m else ""
+
+def parse_buyer_fields(text: str) -> Dict[str, str]:
+    b = extract_buyer_block(text)
+    result = {"buyer_npwp": "", "buyer_name": "", "buyer_address": "", "buyer_email": "", "buyer_id_tku": ""}
+
+    m = re.search(r"NPWP\s*:\s*([0-9\.]+)", b)
+    if m:
+        result["buyer_npwp"] = re.sub(r"\D", "", m.group(1))
+
+    m = re.search(r"Nama\s*:\s*(.+)", b)
+    if m:
+        result["buyer_name"] = m.group(1).strip()
+
+    m = re.search(r"Alamat\s*:\s*(.*?)\s*(?:NPWP|Email|$)", b, re.S)
+    if m:
+        address = " ".join(line.strip() for line in m.group(1).splitlines() if line.strip())
+        result["buyer_address"] = address.strip()
+
+    m = re.search(r"Email\s*:\s*([\w\.-]+@[\w\.-]+)", b)
+    if m:
+        result["buyer_email"] = m.group(1).strip()
+
+    m = re.search(r"#\s*(\d{8,30})", b)
+    if m:
+        result["buyer_id_tku"] = m.group(1).strip()
+
+    return result
+
+def extract_goods_and_dpp(text: str) -> List[Dict[str, Any]]:
+    """
+    Extract only one line for 'Uang Muka / Termin' and its DPP value.
+    """
+    m = re.search(
+        r"Nama Barang Kena Pajak\s*/\s*Jasa Kena Pajak(.*?)Jumlah PPN",
+        text, re.S)
+    items = []
+    if m:
+        block = m.group(1)
+        g = re.search(r"(Uang Muka\s*/\s*Termin).*?Rp\s*([\d\.\,]+)", block)
+        if g:
+            goods_name = g.group(1).strip()
+            dpp_raw = g.group(2).strip()
+            try:
+                dpp_val = float(dpp_raw.replace(".", "").replace(",", "."))
+            except:
+                dpp_val = None
+            items.append({"goods_service": goods_name, "dpp": dpp_val, "dpp_raw": dpp_raw})
+    return items
+
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -68,102 +160,6 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
             page_text = page.extract_text() or ""
             text += page_text + "\n"
     return text
-
-
-def extract_date(text: str) -> str:
-    # Match both with and without comma before date
-    m = re.search(r"(?:,|\b)\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
-    if not m:
-        return ""
-    day, month, year = m.groups()
-    month_num = MONTHS_ID.get(month.capitalize())
-    if not month_num:
-        return ""
-    return f"{int(day):02d}/{month_num}/{year}"
-
-
-def extract_facture_type(text: str):
-    m = re.search(r"Kode dan Nomor Seri Faktur Pajak\s*:\s*([0-9A-Za-z\-]+)", text)
-    if not m:
-        return "", ""
-    code = m.group(1).strip()
-    ftype = "Normal" if code.startswith("040") else "Pembetulan"
-    return code, ftype
-
-
-def extract_reference(text: str):
-    # Match Referensi: followed by any text until newline
-    m = re.search(r"Referensi\s*:\s*(.+)", text)
-    if not m:
-        return ""
-    ref = m.group(1).strip()
-    # clean up possible trailing words like “Tanggal”
-    ref = ref.splitlines()[0].strip()
-    return ref
-
-
-def extract_buyer_fields(text: str):
-    buyer_block = re.search(
-        r"Pembeli Barang Kena Pajak\/Penerima Jasa Kena Pajak(.*?)(?:Nama Barang Kena Pajak|Dasar Pengenaan Pajak)",
-        text, re.S)
-    if not buyer_block:
-        return {}, ""
-    block = buyer_block.group(1)
-    buyer = {
-        "npwp": "",
-        "name": "",
-        "address": "",
-        "email": "",
-        "id_tku": ""
-    }
-
-    m = re.search(r"NPWP\s*:\s*([0-9\.]+)", block)
-    if m:
-        buyer["npwp"] = re.sub(r"\D", "", m.group(1))
-
-    m = re.search(r"Nama\s*:\s*(.+)", block)
-    if m:
-        buyer["name"] = m.group(1).strip()
-
-    # Address can span multiple lines before next label
-    m = re.search(r"Alamat\s*:\s*(.*?)\s*(?:NPWP|Email|$)", block, re.S)
-    if m:
-        address = " ".join(line.strip() for line in m.group(1).splitlines() if line.strip())
-        buyer["address"] = address.strip()
-
-    m = re.search(r"Email\s*:\s*([\w\.-]+@[\w\.-]+)", block)
-    if m:
-        buyer["email"] = m.group(1).strip()
-
-    # Buyer ID TKU after "#"
-    m = re.search(r"#\s*(\d{8,30})", block)
-    if m:
-        buyer["id_tku"] = m.group(1).strip()
-
-    return buyer, block
-
-
-def extract_goods_and_dpp(text: str):
-    """
-    Extracts the first occurrence of 'Nama Barang Kena Pajak / Jasa Kena Pajak'
-    and its corresponding 'Harga Jual / Penggantian / Uang Muka / Termin'.
-    Returns one row only.
-    """
-    block = re.search(
-        r"Nama Barang Kena Pajak\s*/\s*Jasa Kena Pajak(.*?)Jumlah PPN",
-        text, re.S)
-    if not block:
-        return {"goods_service": "", "dpp": None, "dpp_raw": ""}
-    part = block.group(1)
-
-    # Find “Uang Muka / Termin” and its numeric value
-    m = re.search(r"(Uang Muka\s*/\s*Termin).*?Rp\s*([\d\.\,]+)", part)
-    if not m:
-        return {"goods_service": "", "dpp": None, "dpp_raw": ""}
-    goods = m.group(1).strip()
-    dpp_raw = m.group(2).strip()
-    dpp_num = float(dpp_raw.replace(".", "").replace(",", ".")) if dpp_raw else None
-    return {"goods_service": goods, "dpp": dpp_num, "dpp_raw": dpp_raw}
 
 # -----------------------
 # UI
