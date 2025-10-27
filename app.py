@@ -160,7 +160,12 @@ with col3:
     page = st.selectbox("", ["Extractor", "XML Converter (placeholder)"])
 
 if page != "XML Converter (placeholder)":
-    uploaded = st.file_uploader("Upload Coretax PDF(s)", type=["pdf"], accept_multiple_files=True)
+    uploaded = st.file_uploader(
+        "Upload Coretax PDF(s)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.get('uploader_key', 0)}"
+    )
 else:
     st.info("XML Converter page — placeholder. We'll implement this later.")
     uploaded = []
