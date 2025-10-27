@@ -167,7 +167,7 @@ if page != "XML Converter (placeholder)":
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.get('uploader_key', 0)}"
     )
-elseelse:
+else:
     st.markdown("### XML Converter")
     st.write("Upload the Coretax Faktur Excel (format like *Sample Faktur PK Template v.1.6.xlsx*) to generate a Faktur Pajak XML file.")
 
