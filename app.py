@@ -182,7 +182,7 @@ with reset_col:
 if reset_btn:
     st.session_state["results_df"] = None
     st.session_state["last_log_id"] = None
-    st.experimental_rerun()
+    st.rerun()
 
 if extract_btn:
     if not uploaded:
