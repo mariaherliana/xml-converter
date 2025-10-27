@@ -158,9 +158,9 @@ with col2:
     st.markdown("[Download Faktur Pajak Keluaran Excel template](https://pajak.go.id/sites/default/files/2025-03/Sample%20Faktur%20PK%20Template%20v.1.4.xml.zip)")
 with col3:
     st.markdown("**Pages**")
-    page = st.selectbox("", ["Extractor", "XML Converter (placeholder)"])
+    page = st.selectbox("", ["Extractor", "XML Converter"])
 
-if page != "XML Converter (placeholder)":
+if page != "XML Converter":
     uploaded = st.file_uploader(
         "Upload Coretax PDF(s)",
         type=["pdf"],
@@ -181,23 +181,20 @@ else:
 
         if st.button("Convert to XML"):
             with st.spinner("Converting XLSX to XML..."):
-                # Root element
+                # Build XML
                 root = ET.Element("TaxInvoiceBulk")
                 tin_value = str(df_faktur.get("NPWP Penjual", ["999999999999999"])[0]).strip() if "NPWP Penjual" in df_faktur.columns else "999999999999999"
                 ET.SubElement(root, "TIN").text = tin_value
-
                 list_invoices = ET.SubElement(root, "ListOfTaxInvoice")
+
+                def set_elem(parent, tag, val):
+                    if pd.notna(val) and str(val).strip() != "":
+                        ET.SubElement(parent, tag).text = str(val).strip()
+                    else:
+                        ET.SubElement(parent, tag).text = ""
 
                 for _, row in df_faktur.iterrows():
                     faktur_elem = ET.SubElement(list_invoices, "TaxInvoice")
-
-                    # Basic header mapping
-                    def set_elem(parent, tag, val):
-                        if pd.notna(val) and str(val).strip() != "":
-                            ET.SubElement(parent, tag).text = str(val).strip()
-                        else:
-                            ET.SubElement(parent, tag).text = ""
-
                     set_elem(faktur_elem, "TaxInvoiceDate", row.get("Tanggal Faktur", ""))
                     set_elem(faktur_elem, "TaxInvoiceOpt", row.get("Jenis Faktur", "Normal"))
                     set_elem(faktur_elem, "TrxCode", row.get("Kode Transaksi", "07"))
@@ -216,9 +213,7 @@ else:
                     set_elem(faktur_elem, "BuyerEmail", row.get("Email Pembeli", ""))
                     set_elem(faktur_elem, "BuyerIDTKU", row.get("IDTKU Pembeli", ""))
 
-                    # Build ListOfGoodService
                     list_goods = ET.SubElement(faktur_elem, "ListOfGoodService")
-
                     baris = row.get("Baris")
                     if pd.notna(baris):
                         detail_rows = df_detail[df_detail["Baris"] == baris]
@@ -238,9 +233,24 @@ else:
                             set_elem(goods_elem, "STLGRate", d.get("Tarif PPnBM", "0"))
                             set_elem(goods_elem, "STLG", d.get("PPnBM", "0"))
 
-                # Write XML to memory
+                # Build XML bytes
                 xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
                 st.success("✅ Conversion complete!")
+
+                # ---- Supabase log ----
+                if supabase:
+                    log_payload = {
+                        "processed_count": len(df_faktur),
+                        "status": "Converted",
+                        "details": {"filename": xlsx_file.name}
+                    }
+                    try:
+                        supabase.table("extraction_logs").insert(log_payload).execute()
+                        st.caption("Log saved to Supabase.")
+                    except Exception as e:
+                        st.warning(f"Supabase logging failed: {e}")
+                else:
+                    st.info("Supabase not configured; skipping logging.")
 
                 st.download_button(
                     "Download XML",
