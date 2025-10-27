@@ -1,10 +1,7 @@
-# app.py
+# app.py (revised extractor logic)
 import re
 import io
 import datetime
-import base64
-from typing import List, Dict, Any
-
 import streamlit as st
 import pandas as pd
 import pdfplumber
@@ -19,169 +16,25 @@ load_dotenv()
 # -----------------------
 SUPABASE_URL = st.secrets["SUPABASE"]["URL"] if "SUPABASE" in st.secrets else os.getenv("SUPABASE_URL")
 SUPABASE_KEY = st.secrets["SUPABASE"]["KEY"] if "SUPABASE" in st.secrets else os.getenv("SUPABASE_KEY")
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    supabase = None
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 # -----------------------
-# Palette / Theme colors
+# UI Config
 # -----------------------
-PALETTE = {
-    "primary": "#E2A16F",  # warm tan
-    "bg_light": "#FFF0DD",
-    "muted": "#D1D3D4",
-    "accent": "#86B0BD"    # blueish
+st.set_page_config(page_title="Coretax PDF Extractor", layout="wide")
+
+# -----------------------
+# Indonesian months map
+# -----------------------
+MONTHS_ID = {
+    "Januari": "01", "Februari": "02", "Maret": "03", "April": "04",
+    "Mei": "05", "Juni": "06", "Juli": "07", "Agustus": "08",
+    "September": "09", "Oktober": "10", "November": "11", "Desember": "12"
 }
 
-st.set_page_config(page_title="Coretax PDF Extractor", layout="wide",
-                   initial_sidebar_state="expanded")
-
-# Minimal theming via CSS using palette
-st.markdown(
-    f"""
-    <style>
-    .stApp {{ background-color: {PALETTE['bg_light']} }}
-    .header {{ background-color: {PALETTE['primary']}; padding: 10px; border-radius: 8px; color: white }}
-    .stButton>button {{ background-color: {PALETTE['accent']}; color: white; border: none }}
-    .reset-btn .stButton>button {{ background-color: #999; color: white }}
-    table.dataframe tbody tr:hover {{ background-color: {PALETTE['muted']} }}
-    </style>
-    """, unsafe_allow_html=True)
-
 # -----------------------
-# Helper extraction functions
+# Extraction functions
 # -----------------------
-def parse_date_from_text(text: str) -> str:
-    """
-    Looks for lines like:
-    'KOTA ADM. JAKARTA SELATAN, 30 September 2025'
-    Returns DD/MM/YYYY or empty string.
-    """
-    # common pattern: , <day> <MonthName> <year>
-    m = re.search(r",\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
-    if m:
-        day, mon_name, year = m.group(1), m.group(2), m.group(3)
-        try:
-            dt = datetime.datetime.strptime(f"{day} {mon_name} {year}", "%d %B %Y")
-        except ValueError:
-            # try English month
-            try:
-                dt = datetime.datetime.strptime(f"{day} {mon_name} {year}", "%d %b %Y")
-            except Exception:
-                return ""
-        return dt.strftime("%d/%m/%Y")
-    return ""
-
-def parse_kode_seri_type(text: str) -> Dict[str,str]:
-    """
-    Find 'Kode dan Nomor Seri Faktur Pajak: 0400250031...' -> get first 3 digits
-    If starts with 040 => Normal else Pembetulan
-    """
-    m = re.search(r"Kode dan Nomor Seri Faktur Pajak[:\s]+([0-9A-Za-z\-]+)", text)
-    if m:
-        code = m.group(1).strip()
-        prefix = code[:3]
-        if prefix == "040":
-            ftype = "Normal"
-        else:
-            ftype = "Pembetulan"
-        return {"raw_code": code, "type": ftype}
-    return {"raw_code": "", "type": ""}
-
-def parse_reference(text: str) -> str:
-    # look for (Referensi: something) or Referensi: something
-    m = re.search(r"Referensi[:\s]*([A-Za-z0-9\-\_\/]+)", text)
-    if m:
-        return m.group(1).strip()
-    m2 = re.search(r"\(Referensi:\s*([^\)]+)\)", text)
-    if m2:
-        return m2.group(1).strip()
-    return ""
-
-def extract_buyer_block(text: str) -> str:
-    """Return the textual block for 'Pembeli Barang Kena Pajak' section (approx)."""
-    # crude approach: find 'Pembeli Barang Kena Pajak' then take next 400-800 chars
-    m = re.search(r"(Pembeli Barang Kena Pajak\/Penerima Jasa Kena Pajak:.*?)(?:\n\n|\Z)", text, re.S)
-    if m:
-        return m.group(1)
-    # fallback: search for 'Pembeli Barang' and take chunk
-    m2 = re.search(r"Pembeli Barang.*", text, re.S)
-    if m2:
-        start = m2.start()
-        return text[start:start+800]
-    return ""
-
-def parse_buyer_fields(text: str) -> Dict[str,str]:
-    b = extract_buyer_block(text)
-    result = {"buyer_npwp":"", "buyer_name":"", "buyer_address":"", "buyer_email":"", "buyer_id_tku":""}
-    # NPWP : digits
-    m = re.search(r"NPWP\s*[:]\s*([0-9]{15,20})", b)
-    if m:
-        result["buyer_npwp"] = m.group(1).strip()
-    # Name
-    m = re.search(r"Nama\s*[:]\s*([^\n\r]+)", b)
-    if m:
-        result["buyer_name"] = m.group(1).strip()
-    # Alamat
-    m = re.search(r"Alamat\s*[:]\s*([^\n\r\(]+(?:\n[^\n\r]+)?)", b)
-    if m:
-        addr = m.group(1).strip()
-        # remove trailing NPWP if present at same line or following
-        result["buyer_address"] = re.sub(r"\s*NPWP.*", "", addr).strip()
-    else:
-        # try to capture full address by taking up to NPWP line
-        m2 = re.search(r"Alamat\s*[:]\s*(.*?)\nNPWP", b, re.S)
-        if m2:
-            result["buyer_address"] = " ".join([ln.strip() for ln in m2.group(1).splitlines()]).strip()
-    # Email
-    m = re.search(r"Email[:\s]*([A-Za-z0-9\.\-_]+@[A-Za-z0-9\.\-]+)", b)
-    if m:
-        result["buyer_email"] = m.group(1).strip()
-    # Buyer ID TKU: find '#' followed by digits in address line
-    m = re.search(r"#\s*([0-9]{8,30})", b)
-    if m:
-        result["buyer_id_tku"] = m.group(1).strip()
-    return result
-
-def extract_goods_and_dpp(text: str) -> List[Dict[str,Any]]:
-    """
-    Extract lines under the "Nama Barang Kena Pajak / Jasa Kena Pajak" and the price column.
-    This is heuristic: find the table area and parse each item block.
-    """
-    # We'll search for the table header then grab following lines until summary area like "Dasar Pengenaan Pajak"
-    m = re.search(r"Nama Barang Kena Pajak\s*\/\s*Jasa Kena Pajak(.*?)(?:Dasar Pengenaan Pajak|Jumlah PPN)", text, re.S|re.I)
-    items = []
-    if m:
-        block = m.group(1)
-        # Items are often numbered: "1 000000\n\nCall fee\nRp 762.300,00 x 1,00"
-        # Split by lines that start with a digit number and possibly space
-        parts = re.split(r"\n(?=\s*\d+\s+)", block)
-        for p in parts:
-            # name: first non-empty line
-            lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
-            if not lines:
-                continue
-            # find a line that looks like a currency: 'Rp 762.300,00' or ends with numbers and comma
-            price = ""
-            name = lines[0]
-            # try to locate price inside lines
-            for ln in lines:
-                mprice = re.search(r"Rp\s*([\d\.\,]+)", ln)
-                if mprice:
-                    price = mprice.group(1).strip()
-                    break
-            # convert price to plain number
-            price_num = None
-            if price:
-                price_num = price.replace(".", "").replace(",", ".")
-                try:
-                    price_num = float(price_num)
-                except:
-                    price_num = None
-            items.append({"goods_service": name, "dpp": price_num, "dpp_raw": price})
-    return items
-
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -190,156 +43,155 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
             text += page_text + "\n"
     return text
 
+
+def extract_date(text: str) -> str:
+    # Match both with and without comma before date
+    m = re.search(r"(?:,|\b)\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
+    if not m:
+        return ""
+    day, month, year = m.groups()
+    month_num = MONTHS_ID.get(month.capitalize())
+    if not month_num:
+        return ""
+    return f"{int(day):02d}/{month_num}/{year}"
+
+
+def extract_facture_type(text: str):
+    m = re.search(r"Kode dan Nomor Seri Faktur Pajak\s*:\s*([0-9A-Za-z\-]+)", text)
+    if not m:
+        return "", ""
+    code = m.group(1).strip()
+    ftype = "Normal" if code.startswith("040") else "Pembetulan"
+    return code, ftype
+
+
+def extract_reference(text: str):
+    # Match Referensi: followed by any text until newline
+    m = re.search(r"Referensi\s*:\s*(.+)", text)
+    if not m:
+        return ""
+    ref = m.group(1).strip()
+    # clean up possible trailing words like “Tanggal”
+    ref = ref.splitlines()[0].strip()
+    return ref
+
+
+def extract_buyer_fields(text: str):
+    buyer_block = re.search(
+        r"Pembeli Barang Kena Pajak\/Penerima Jasa Kena Pajak(.*?)(?:Nama Barang Kena Pajak|Dasar Pengenaan Pajak)",
+        text, re.S)
+    if not buyer_block:
+        return {}, ""
+    block = buyer_block.group(1)
+    buyer = {
+        "npwp": "",
+        "name": "",
+        "address": "",
+        "email": "",
+        "id_tku": ""
+    }
+
+    m = re.search(r"NPWP\s*:\s*([0-9\.]+)", block)
+    if m:
+        buyer["npwp"] = re.sub(r"\D", "", m.group(1))
+
+    m = re.search(r"Nama\s*:\s*(.+)", block)
+    if m:
+        buyer["name"] = m.group(1).strip()
+
+    # Address can span multiple lines before next label
+    m = re.search(r"Alamat\s*:\s*(.*?)\s*(?:NPWP|Email|$)", block, re.S)
+    if m:
+        address = " ".join(line.strip() for line in m.group(1).splitlines() if line.strip())
+        buyer["address"] = address.strip()
+
+    m = re.search(r"Email\s*:\s*([\w\.-]+@[\w\.-]+)", block)
+    if m:
+        buyer["email"] = m.group(1).strip()
+
+    # Buyer ID TKU after "#"
+    m = re.search(r"#\s*(\d{8,30})", block)
+    if m:
+        buyer["id_tku"] = m.group(1).strip()
+
+    return buyer, block
+
+
+def extract_goods_and_dpp(text: str):
+    """
+    Extracts the first occurrence of 'Nama Barang Kena Pajak / Jasa Kena Pajak'
+    and its corresponding 'Harga Jual / Penggantian / Uang Muka / Termin'.
+    Returns one row only.
+    """
+    block = re.search(
+        r"Nama Barang Kena Pajak\s*/\s*Jasa Kena Pajak(.*?)Jumlah PPN",
+        text, re.S)
+    if not block:
+        return {"goods_service": "", "dpp": None, "dpp_raw": ""}
+    part = block.group(1)
+
+    # Find “Uang Muka / Termin” and its numeric value
+    m = re.search(r"(Uang Muka\s*/\s*Termin).*?Rp\s*([\d\.\,]+)", part)
+    if not m:
+        return {"goods_service": "", "dpp": None, "dpp_raw": ""}
+    goods = m.group(1).strip()
+    dpp_raw = m.group(2).strip()
+    dpp_num = float(dpp_raw.replace(".", "").replace(",", ".")) if dpp_raw else None
+    return {"goods_service": goods, "dpp": dpp_num, "dpp_raw": dpp_raw}
+
+
 # -----------------------
-# UI
+# Streamlit UI
 # -----------------------
-st.markdown('<div class="header"><h2>Coretax PDF (Faktur) Extractor</h2></div>', unsafe_allow_html=True)
-st.write("Upload one or multiple Coretax-format Faktur Pajak PDFs. Note: app expects Coretax layout.")
+st.title("Coretax PDF Extractor")
 
-# top small controls
-col1, col2, col3 = st.columns([2,1,1])
-with col1:
-    st.markdown("**Actions**")
-    st.markdown("- Upload Coretax PDFs\n- Click *Extract* to parse and log to Supabase\n- Download results as CSV/XLSX")
-with col2:
-    st.markdown("**Download template**")
-    st.markdown("[Download Faktur Pajak Keluaran Excel template](https://pajak.go.id/sites/default/files/2025-03/Sample%20Faktur%20PK%20Template%20v.1.4.xml.zip)")
-with col3:
-    st.markdown("**Pages**")
-    page = st.selectbox("", ["Extractor", "XML Converter (placeholder)"])
+uploaded = st.file_uploader("Upload Coretax PDF(s)", type=["pdf"], accept_multiple_files=True)
 
-if page != "XML Converter (placeholder)":
-    uploaded = st.file_uploader("Upload Coretax PDF(s)", type=["pdf"], accept_multiple_files=True)
-else:
-    st.info("XML Converter page — placeholder. We'll implement this later.")
-    uploaded = []
+if st.button("Extract") and uploaded:
+    results = []
+    for f in uploaded:
+        pdf_bytes = f.read()
+        text = extract_text_from_pdf_bytes(pdf_bytes)
 
-st.checkbox("I confirm these are Coretax-format Faktur Pajak PDFs", value=False, key="confirm_coretax")
+        date = extract_date(text)
+        kode_seri_raw, facture_type = extract_facture_type(text)
+        reference = extract_reference(text)
+        buyer, _ = extract_buyer_fields(text)
+        goods = extract_goods_and_dpp(text)
 
-# Session storage for results
-if "results_df" not in st.session_state:
-    st.session_state["results_df"] = None
-if "last_log_id" not in st.session_state:
-    st.session_state["last_log_id"] = None
+        row = {
+            "source_filename": f.name,
+            "date": date,
+            "facture_type": facture_type,
+            "kode_seri_raw": kode_seri_raw,
+            "reference": reference,
+            "buyer_npwp": buyer.get("npwp", ""),
+            "buyer_name": buyer.get("name", ""),
+            "buyer_address": buyer.get("address", ""),
+            "buyer_email": buyer.get("email", ""),
+            "buyer_id_tku": buyer.get("id_tku", ""),
+            "goods_service": goods["goods_service"],
+            "dpp": goods["dpp"],
+            "dpp_raw": goods["dpp_raw"]
+        }
+        results.append(row)
 
-extract_col, reset_col = st.columns([1,1])
-with extract_col:
-    extract_btn = st.button("Extract", key="extract_btn")
-with reset_col:
-    reset_btn = st.button("Reset (clear uploads & results)", key="reset_btn")
-
-if reset_btn:
-    st.session_state["results_df"] = None
-    st.session_state["last_log_id"] = None
-    st.experimental_rerun()
-
-if extract_btn:
-    if not uploaded:
-        st.warning("Please upload at least one Coretax PDF before extracting.")
-    else:
-        if not st.session_state.get("confirm_coretax", False):
-            st.warning("Please confirm the files are Coretax-format PDFs.")
-        else:
-            rows = []
-            for f in uploaded:
-                raw = f.read()
-                text = extract_text_from_pdf_bytes(raw)
-                date = parse_date_from_text(text)
-                kode_info = parse_kode_seri_type(text)
-                reference = parse_reference(text)
-                buyer = parse_buyer_fields(text)
-                goods = extract_goods_and_dpp(text)
-                # If goods empty, create fallback single row with blank goods
-                if not goods:
-                    goods = [{"goods_service":"", "dpp": None, "dpp_raw": ""}]
-
-                # For each goods/service produce a row
-                for g in goods:
-                    row = {
-                        "source_filename": f.name,
-                        "date": date,
-                        "facture_type": kode_info.get("type"),
-                        "kode_seri_raw": kode_info.get("raw_code"),
-                        "reference": reference,
-                        "buyer_npwp": buyer.get("buyer_npwp"),
-                        "buyer_name": buyer.get("buyer_name"),
-                        "buyer_address": buyer.get("buyer_address"),
-                        "buyer_email": buyer.get("buyer_email"),
-                        "buyer_id_tku": buyer.get("buyer_id_tku"),
-                        "goods_service": g.get("goods_service"),
-                        "dpp": g.get("dpp"),
-                        "dpp_raw": g.get("dpp_raw")
-                    }
-                    rows.append(row)
-
-            df = pd.DataFrame(rows)
-            st.session_state["results_df"] = df
-
-            # Log to Supabase: Processed
-            if supabase:
-                log_payload = {
+        # Log to Supabase
+        if supabase:
+            try:
+                supabase.table("extraction_logs").insert({
                     "processed_count": len(uploaded),
                     "status": "Processed",
                     "details": {"files": [f.name for f in uploaded]}
-                }
-                try:
-                    resp = supabase.table("extraction_logs").insert(log_payload).execute()
-                    # store returned id if available
-                    try:
-                        inserted = resp.data[0]
-                        st.session_state["last_log_id"] = inserted.get("id")
-                    except Exception:
-                        st.session_state["last_log_id"] = None
-                except Exception as e:
-                    st.error(f"Supabase logging failed: {e}")
-            else:
-                st.info("Supabase not configured; skipping logging.")
+                }).execute()
+            except Exception as e:
+                st.warning(f"Supabase log failed: {e}")
 
-# Show results
-if st.session_state["results_df"] is not None:
-    df = st.session_state["results_df"]
-    st.markdown("### Extraction results")
+    df = pd.DataFrame(results)
     st.dataframe(df)
 
-    # Downloads
     csv = df.to_csv(index=False).encode("utf-8")
-    xlsx_buffer = io.BytesIO()
-    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="extraction")
-    xlsx_data = xlsx_buffer.getvalue()
+    st.download_button("Download CSV", csv, "extracted.csv", "text/csv")
 
-    col_a, col_b, col_c = st.columns([1,1,1])
-    with col_a:
-        st.download_button("Download CSV", data=csv, file_name="extraction.csv", mime="text/csv")
-    with col_b:
-        st.download_button("Download XLSX", data=xlsx_data, file_name="extraction.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with col_c:
-        # Copy as plain text to clipboard is browser-level; provide a textarea for manual copy
-        st.text_area("Copy results (select all to copy):", value=df.to_csv(sep="\t", index=False), height=120)
-
-    # If user downloads — we try to update Supabase status to Downloaded.
-    # Note: Streamlit's download button cannot give a callback event when click completes.
-    # We provide a manual "Mark Downloaded" button to update the log.
-    if st.session_state.get("last_log_id"):
-        if st.button("Mark as Downloaded (update log)"):
-            if supabase:
-                try:
-                    supabase.table("extraction_logs").update({"status":"Downloaded"}).eq("id", st.session_state["last_log_id"]).execute()
-                    st.success("Log updated to Downloaded.")
-                except Exception as e:
-                    st.error(f"Failed to update log: {e}")
-            else:
-                st.info("Supabase not configured; cannot update log.")
-
-# Footer / notes
-st.markdown("---")
-st.markdown("**Notes & assumptions**")
-st.markdown("""
-- This tool expects Coretax layout PDFs (the invoice you uploaded was used to tune heuristics). Example sample used: the Akasa file you uploaded. :contentReference[oaicite:1]{index=1}  
-- Date parsing is heuristic: it looks for patterns like `, 30 September 2025` and normalizes to `DD/MM/YYYY`.  
-- Facture type is decided by the first 3 digits of `Kode dan Nomor Seri Faktur Pajak` — `040` => `Normal`, other values => `Pembetulan`.  
-- Buyer ID TKU is the numeric string that appears after `#` in the buyer address line.  
-- Goods & DPP extraction is table-heuristic-based and may need adjustments for edge cases.  
-- If you want automatic update of logs on real download events, we can implement a signed-download route (server) to capture the click; for now the app provides a manual "Mark as Downloaded" button to update Supabase.
-""")
-
+else:
+    st.info("Upload Coretax-format Faktur Pajak PDFs to begin.")
