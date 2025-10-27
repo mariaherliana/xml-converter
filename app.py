@@ -1,7 +1,10 @@
-# app.py (revised extractor logic)
+# app.py
 import re
 import io
 import datetime
+import base64
+from typing import List, Dict, Any
+
 import streamlit as st
 import pandas as pd
 import pdfplumber
@@ -16,12 +19,35 @@ load_dotenv()
 # -----------------------
 SUPABASE_URL = st.secrets["SUPABASE"]["URL"] if "SUPABASE" in st.secrets else os.getenv("SUPABASE_URL")
 SUPABASE_KEY = st.secrets["SUPABASE"]["KEY"] if "SUPABASE" in st.secrets else os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
 
 # -----------------------
-# UI Config
+# Palette / Theme colors
 # -----------------------
-st.set_page_config(page_title="Coretax PDF Extractor", layout="wide")
+PALETTE = {
+    "primary": "#E2A16F",  # warm tan
+    "bg_light": "#FFF0DD",
+    "muted": "#D1D3D4",
+    "accent": "#86B0BD"    # blueish
+}
+
+st.set_page_config(page_title="Coretax PDF Extractor", layout="wide",
+                   initial_sidebar_state="expanded")
+
+# Minimal theming via CSS using palette
+st.markdown(
+    f"""
+    <style>
+    .stApp {{ background-color: {PALETTE['bg_light']} }}
+    .header {{ background-color: {PALETTE['primary']}; padding: 10px; border-radius: 8px; color: white }}
+    .stButton>button {{ background-color: {PALETTE['accent']}; color: white; border: none }}
+    .reset-btn .stButton>button {{ background-color: #999; color: white }}
+    table.dataframe tbody tr:hover {{ background-color: {PALETTE['muted']} }}
+    </style>
+    """, unsafe_allow_html=True)
 
 # -----------------------
 # Indonesian months map
@@ -139,59 +165,156 @@ def extract_goods_and_dpp(text: str):
     dpp_num = float(dpp_raw.replace(".", "").replace(",", ".")) if dpp_raw else None
     return {"goods_service": goods, "dpp": dpp_num, "dpp_raw": dpp_raw}
 
-
 # -----------------------
-# Streamlit UI
+# UI
 # -----------------------
-st.title("Coretax PDF Extractor")
+st.markdown('<div class="header"><h2>Coretax PDF (Faktur) Extractor</h2></div>', unsafe_allow_html=True)
+st.write("Upload one or multiple Coretax-format Faktur Pajak PDFs. Note: app expects Coretax layout.")
 
-uploaded = st.file_uploader("Upload Coretax PDF(s)", type=["pdf"], accept_multiple_files=True)
+# top small controls
+col1, col2, col3 = st.columns([2,1,1])
+with col1:
+    st.markdown("**Actions**")
+    st.markdown("- Upload Coretax PDFs\n- Click *Extract* to parse and log to Supabase\n- Download results as CSV/XLSX")
+with col2:
+    st.markdown("**Download template**")
+    st.markdown("[Download Faktur Pajak Keluaran Excel template](https://pajak.go.id/sites/default/files/2025-03/Sample%20Faktur%20PK%20Template%20v.1.4.xml.zip)")
+with col3:
+    st.markdown("**Pages**")
+    page = st.selectbox("", ["Extractor", "XML Converter (placeholder)"])
 
-if st.button("Extract") and uploaded:
-    results = []
-    for f in uploaded:
-        pdf_bytes = f.read()
-        text = extract_text_from_pdf_bytes(pdf_bytes)
+if page != "XML Converter (placeholder)":
+    uploaded = st.file_uploader("Upload Coretax PDF(s)", type=["pdf"], accept_multiple_files=True)
+else:
+    st.info("XML Converter page — placeholder. We'll implement this later.")
+    uploaded = []
 
-        date = extract_date(text)
-        kode_seri_raw, facture_type = extract_facture_type(text)
-        reference = extract_reference(text)
-        buyer, _ = extract_buyer_fields(text)
-        goods = extract_goods_and_dpp(text)
+st.checkbox("I confirm these are Coretax-format Faktur Pajak PDFs", value=False, key="confirm_coretax")
 
-        row = {
-            "source_filename": f.name,
-            "date": date,
-            "facture_type": facture_type,
-            "kode_seri_raw": kode_seri_raw,
-            "reference": reference,
-            "buyer_npwp": buyer.get("npwp", ""),
-            "buyer_name": buyer.get("name", ""),
-            "buyer_address": buyer.get("address", ""),
-            "buyer_email": buyer.get("email", ""),
-            "buyer_id_tku": buyer.get("id_tku", ""),
-            "goods_service": goods["goods_service"],
-            "dpp": goods["dpp"],
-            "dpp_raw": goods["dpp_raw"]
-        }
-        results.append(row)
+# Session storage for results
+if "results_df" not in st.session_state:
+    st.session_state["results_df"] = None
+if "last_log_id" not in st.session_state:
+    st.session_state["last_log_id"] = None
 
-        # Log to Supabase
-        if supabase:
-            try:
-                supabase.table("extraction_logs").insert({
+extract_col, reset_col = st.columns([1,1])
+with extract_col:
+    extract_btn = st.button("Extract", key="extract_btn")
+with reset_col:
+    reset_btn = st.button("Reset (clear uploads & results)", key="reset_btn")
+
+if reset_btn:
+    st.session_state["results_df"] = None
+    st.session_state["last_log_id"] = None
+    st.experimental_rerun()
+
+if extract_btn:
+    if not uploaded:
+        st.warning("Please upload at least one Coretax PDF before extracting.")
+    else:
+        if not st.session_state.get("confirm_coretax", False):
+            st.warning("Please confirm the files are Coretax-format PDFs.")
+        else:
+            rows = []
+            for f in uploaded:
+                raw = f.read()
+                text = extract_text_from_pdf_bytes(raw)
+                date = parse_date_from_text(text)
+                kode_info = parse_kode_seri_type(text)
+                reference = parse_reference(text)
+                buyer = parse_buyer_fields(text)
+                goods = extract_goods_and_dpp(text)
+                # If goods empty, create fallback single row with blank goods
+                if not goods:
+                    goods = [{"goods_service":"", "dpp": None, "dpp_raw": ""}]
+
+                # For each goods/service produce a row
+                for g in goods:
+                    row = {
+                        "source_filename": f.name,
+                        "date": date,
+                        "facture_type": kode_info.get("type"),
+                        "kode_seri_raw": kode_info.get("raw_code"),
+                        "reference": reference,
+                        "buyer_npwp": buyer.get("buyer_npwp"),
+                        "buyer_name": buyer.get("buyer_name"),
+                        "buyer_address": buyer.get("buyer_address"),
+                        "buyer_email": buyer.get("buyer_email"),
+                        "buyer_id_tku": buyer.get("buyer_id_tku"),
+                        "goods_service": g.get("goods_service"),
+                        "dpp": g.get("dpp"),
+                        "dpp_raw": g.get("dpp_raw")
+                    }
+                    rows.append(row)
+
+            df = pd.DataFrame(rows)
+            st.session_state["results_df"] = df
+
+            # Log to Supabase: Processed
+            if supabase:
+                log_payload = {
                     "processed_count": len(uploaded),
                     "status": "Processed",
                     "details": {"files": [f.name for f in uploaded]}
-                }).execute()
-            except Exception as e:
-                st.warning(f"Supabase log failed: {e}")
+                }
+                try:
+                    resp = supabase.table("extraction_logs").insert(log_payload).execute()
+                    # store returned id if available
+                    try:
+                        inserted = resp.data[0]
+                        st.session_state["last_log_id"] = inserted.get("id")
+                    except Exception:
+                        st.session_state["last_log_id"] = None
+                except Exception as e:
+                    st.error(f"Supabase logging failed: {e}")
+            else:
+                st.info("Supabase not configured; skipping logging.")
 
-    df = pd.DataFrame(results)
+# Show results
+if st.session_state["results_df"] is not None:
+    df = st.session_state["results_df"]
+    st.markdown("### Extraction results")
     st.dataframe(df)
 
+    # Downloads
     csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, "extracted.csv", "text/csv")
+    xlsx_buffer = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="extraction")
+    xlsx_data = xlsx_buffer.getvalue()
 
-else:
-    st.info("Upload Coretax-format Faktur Pajak PDFs to begin.")
+    col_a, col_b, col_c = st.columns([1,1,1])
+    with col_a:
+        st.download_button("Download CSV", data=csv, file_name="extraction.csv", mime="text/csv")
+    with col_b:
+        st.download_button("Download XLSX", data=xlsx_data, file_name="extraction.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with col_c:
+        # Copy as plain text to clipboard is browser-level; provide a textarea for manual copy
+        st.text_area("Copy results (select all to copy):", value=df.to_csv(sep="\t", index=False), height=120)
+
+    # If user downloads — we try to update Supabase status to Downloaded.
+    # Note: Streamlit's download button cannot give a callback event when click completes.
+    # We provide a manual "Mark Downloaded" button to update the log.
+    if st.session_state.get("last_log_id"):
+        if st.button("Mark as Downloaded (update log)"):
+            if supabase:
+                try:
+                    supabase.table("extraction_logs").update({"status":"Downloaded"}).eq("id", st.session_state["last_log_id"]).execute()
+                    st.success("Log updated to Downloaded.")
+                except Exception as e:
+                    st.error(f"Failed to update log: {e}")
+            else:
+                st.info("Supabase not configured; cannot update log.")
+
+# Footer / notes
+st.markdown("---")
+st.markdown("**Notes & assumptions**")
+st.markdown("""
+- This tool expects Coretax layout PDFs (the invoice you uploaded was used to tune heuristics). Example sample used: the Akasa file you uploaded. :contentReference[oaicite:1]{index=1}  
+- Date parsing is heuristic: it looks for patterns like `, 30 September 2025` and normalizes to `DD/MM/YYYY`.  
+- Facture type is decided by the first 3 digits of `Kode dan Nomor Seri Faktur Pajak` — `040` => `Normal`, other values => `Pembetulan`.  
+- Buyer ID TKU is the numeric string that appears after `#` in the buyer address line.  
+- Goods & DPP extraction is table-heuristic-based and may need adjustments for edge cases.  
+- If you want automatic update of logs on real download events, we can implement a signed-download route (server) to capture the click; for now the app provides a manual "Mark as Downloaded" button to update Supabase.
+""")
+
