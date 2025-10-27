@@ -180,17 +180,23 @@ with reset_col:
     reset_btn = st.button("Reset (clear uploads & results)", key="reset_btn")
 
 if reset_btn:
-    st.session_state["results_df"] = None
-    st.session_state["last_log_id"] = None
+    # Clear stored results and uploaded files
+    st.session_state.clear()
+    # Change uploader key to reset the widget
+    if "uploader_key" not in st.session_state:
+        st.session_state["uploader_key"] = 0
+    else:
+        st.session_state["uploader_key"] += 1
     st.rerun()
 
 if extract_btn:
     if not uploaded:
         st.warning("Please upload at least one Coretax PDF before extracting.")
+    elif not st.session_state.get("confirm_coretax", False):
+        st.warning("Please confirm the files are Coretax-format PDFs.")
     else:
-        if not st.session_state.get("confirm_coretax", False):
-            st.warning("Please confirm the files are Coretax-format PDFs.")
-        else:
+        st.session_state["is_extracting"] = True
+        with st.spinner("⏳ Extracting data, please wait..."):
             rows = []
             for f in uploaded:
                 raw = f.read()
@@ -199,6 +205,7 @@ if extract_btn:
                 kode_info = parse_kode_seri_type(text)
                 reference = parse_reference(text)
                 buyer = parse_buyer_fields(text)
+
                 row = {
                     "source_filename": f.name,
                     "date": date,
@@ -216,7 +223,6 @@ if extract_btn:
             df = pd.DataFrame(rows)
             st.session_state["results_df"] = df
 
-            # Log to Supabase: Processed
             if supabase:
                 log_payload = {
                     "processed_count": len(uploaded),
@@ -225,7 +231,6 @@ if extract_btn:
                 }
                 try:
                     resp = supabase.table("extraction_logs").insert(log_payload).execute()
-                    # store returned id if available
                     try:
                         inserted = resp.data[0]
                         st.session_state["last_log_id"] = inserted.get("id")
@@ -235,6 +240,7 @@ if extract_btn:
                     st.error(f"Supabase logging failed: {e}")
             else:
                 st.info("Supabase not configured; skipping logging.")
+        st.session_state["is_extracting"] = False
 
 # Show results
 if st.session_state["results_df"] is not None:
